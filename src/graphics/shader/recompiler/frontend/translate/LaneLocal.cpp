@@ -9,6 +9,7 @@
 #include <deque>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Whether a wave64 compute program's results in each lane depend on no lane outside the lane's 32-lane half of the
@@ -241,8 +242,56 @@ bool SaveExec(Opcode opcode) {
 	}
 }
 
-// Instructions that read or write other lanes, or depend on the wave's layout: never lane-local here.
-const char* RefusedOpcode(const Instruction& inst) {
+bool IsBranch(const Instruction& inst) {
+	const auto name = magic_enum::enum_name(inst.opcode);
+	return name.starts_with("S_BRANCH") || name.starts_with("S_CBRANCH");
+}
+
+// An LDS that only holds each lane's own values: every LDS instruction a DS_WRITE_ADDTID_B32 or DS_READ_ADDTID_B32
+// (the address M0 + offset + 4 x the lane), M0 there the same constant (the last write of M0 before it, an S_MOVK_I32 /
+// S_MOV_B32 of a constant, with no branch's target from there to it: no other way in), all with the same offset: a lane
+// reads back only what it wrote itself. The compiler's VGPR spills to LDS (Demon's Souls' end-of-frame lighting CS
+// f0dc79c3467d5e0b: M0 = 0 around one write and one read).
+bool LanePrivateLds(const Decoder::Program& program) {
+	const auto&                  instructions = program.instructions;
+	std::unordered_set<uint32_t> targets;
+	for (const auto& inst: instructions)
+		if (IsBranch(inst)) targets.insert(inst.branch_target);
+	const auto writes_m0 = [](const Instruction& inst) {
+		return inst.dst.kind == OperandKind::M0 || inst.dst2.kind == OperandKind::M0;
+	};
+	bool     any = false;
+	Operand  base {};
+	uint32_t offset = 0;
+	for (size_t i = 0; i < instructions.size(); ++i) {
+		const auto& inst = instructions[i];
+		if (inst.family != Family::DS) continue;
+		if ((inst.opcode != Opcode::DS_WRITE_ADDTID_B32 && inst.opcode != Opcode::DS_READ_ADDTID_B32) || inst.gds)
+			return false;
+		// (M0 at the instruction: the last write before it on the only way in.)
+		const Instruction* set = nullptr;
+		for (size_t j = i; j-- > 0;) {
+			if (targets.contains(instructions[j + 1].pc)) break;
+			if (writes_m0(instructions[j])) {
+				set = &instructions[j];
+				break;
+			}
+		}
+		if (set == nullptr || (set->opcode != Opcode::S_MOVK_I32 && set->opcode != Opcode::S_MOV_B32) ||
+		    (set->src0.kind != OperandKind::IntegerInlineConstant && set->src0.kind != OperandKind::LiteralConstant))
+			return false;
+		if (any && (set->src0.value != base.value || set->src0.signed_val != base.signed_val || inst.offset != offset))
+			return false;
+		base   = set->src0;
+		offset = inst.offset;
+		any    = true;
+	}
+	return any;
+}
+
+// Instructions that read or write other lanes, or depend on the wave's layout: never lane-local here (`private_lds`:
+// the program's LDS holds only each lane's own values, LanePrivateLds).
+const char* RefusedOpcode(const Instruction& inst, bool private_lds) {
 	switch (inst.opcode) {
 		case Opcode::V_READLANE_B32: return "V_READLANE";
 		case Opcode::V_WRITELANE_B32: return "V_WRITELANE";
@@ -265,8 +314,9 @@ const char* RefusedOpcode(const Instruction& inst) {
 		case Opcode::UNSUPPORTED: return "unknown instruction";
 		default: break;
 	}
-	// LDS: a wave's lanes may exchange data there without a barrier (a 64-thread group has none).
-	if (inst.family == Family::DS) return "LDS";
+	// LDS: a wave's lanes may exchange data there without a barrier (a 64-thread group has none). Not where each lane
+	// reads only what it wrote (the translator addresses those by the invocation's GCN lane: Translator::DS_ADDTID).
+	if (inst.family == Family::DS && !private_lds) return "LDS";
 	return nullptr;
 }
 
@@ -326,7 +376,7 @@ using Syms = std::array<Sym, 128>;
 class Analysis {
 public:
 	Analysis(const Decoder::Program& program, const CFG::Graph& cfg, bool cooperative = false)
-	    : m_program(program), m_cfg(cfg), m_cooperative(cooperative) {}
+	    : m_program(program), m_cfg(cfg), m_cooperative(cooperative), m_private_lds(LanePrivateLds(program)) {}
 
 	bool Run(std::string* reason) {
 		const auto& blocks = m_cfg.blocks;
@@ -742,7 +792,7 @@ private:
 			cooperate = Cooperate::Exchange;
 			return nullptr;
 		}
-		if (const char* refused = RefusedOpcode(inst)) return refused;
+		if (const char* refused = RefusedOpcode(inst, m_private_lds)) return refused;
 		{
 			// EXEC is set by compares and by 64-bit mask operations (their sources checked below).
 			Scalars written;
@@ -1197,6 +1247,7 @@ private:
 	const Decoder::Program&              m_program;
 	const CFG::Graph&                    m_cfg;
 	bool                                 m_cooperative = false;
+	bool                                 m_private_lds = false; // (LanePrivateLds)
 	std::unordered_map<uint32_t, size_t> m_index_of;
 	std::vector<bool>                    m_exact;    // (by block) a lane-mask branch the wave decides
 	std::vector<bool>                    m_exchange; // (by instruction) a lane read the wave runs
