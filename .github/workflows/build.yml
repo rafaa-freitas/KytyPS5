@@ -6,6 +6,8 @@ name: Build KytyPS5 (Windows)
 on:
   push:
     tags: [ 'v*' ]
+    # (This fork: a push to a perf/ branch builds its test package too.)
+    branches: [ 'perf/**' ]
   workflow_dispatch:
 
 concurrency:
