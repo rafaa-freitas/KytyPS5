@@ -858,7 +858,18 @@ bool Translator::DS_ADDTID(const Decoder::Instruction& inst, bool write) {
 	const auto memory = MemoryInfoFromDecoded(inst);
 	const auto base =
 	    ir.BitwiseAnd(ReadU32(MemorySourceAt(inst, write ? 1u : 0u)), IR::U32(IR::Value(0xffffu)));
-	const auto lane    = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	// The GCN lane. A lane-local wave64 program runs one lane per invocation, each 32-wide subgroup half the wave, its
+	// LaneId the lane in that half (as its lane masks have them): the address takes the invocation's index in the
+	// group's wave instead, as BufferByteAddress does for ADD_TID buffers, or both halves would share the first 32
+	// lanes' slots (LaneLocal.cpp's LanePrivateLds: each lane reads back only what it wrote). (Should the program fall
+	// back to two lanes per invocation after it is translated, the index is still each lane's own: EmitLocalInvocationIndex.)
+	const auto lane =
+	    program.lane_local && program.wave_size == 64u
+	        ? ir.BitwiseAnd(IR::U32(ir.Emit(IR::ValueOpcode::GetBuiltin,
+	                                        {IR::Value(static_cast<uint32_t>(IR::StageInputKind::LocalInvocationIndex)),
+	                                         IR::Value(0u)})),
+	                        IR::U32(IR::Value(63u)))
+	        : IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
 	const auto address = ir.IAdd(base, ir.ShiftLeftLogical(lane, IR::U32(IR::Value(2u))));
 	if (write) {
 		ir.Emit(IR::ValueOpcode::WriteSharedU32,
