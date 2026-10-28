@@ -121,6 +121,20 @@ const Case Cases[] = {
     {"half16", "V_READFIRSTLANE of a lane value", {0x7e020300, 0x7e040205, 0x64020404, 0x7e0c0501, 0xbf810000}},
     // the same with v_add_f32
     {"half32", "", {0x7e020300, 0x7e040205, 0x06020404, 0x7e0c0501, 0xbf810000}},
+    // s_movk_i32 m0, 0; ds_write_addtid_b32 v0; s_movk_i32 m0, 0; ds_read_addtid_b32 v0 (a lane's own spill slot)
+    {"lds_spill", "", {0xb07c0000, 0xdac00000, 0x00000000, 0xb07c0000, 0xdac40000, 0x00000000, 0xbf810000}},
+    // the same, read back with M0 = 4 (the next lane's slot)
+    {"lds_spill_moved", "LDS", {0xb07c0000, 0xdac00000, 0x00000000, 0xb07c0004, 0xdac40000, 0x00000000, 0xbf810000}},
+    // the same, other work between M0's write and the read (v_mov_b32 v1, 1)
+    {"lds_spill_apart", "", {0xb07c0000, 0xdac00000, 0x00000000, 0xb07c0000, 0x7e020281, 0xdac40000, 0x00000000, 0xbf810000}},
+    // the spill, then M0 = s4 before the read (not a constant)
+    {"lds_spill_scalar", "LDS", {0xb07c0000, 0xdac00000, 0x00000000, 0xbefc0304, 0xdac40000, 0x00000000, 0xbf810000}},
+    // M0 = 0; s_cbranch_scc0 L (to the read: another way in); ds_write_addtid_b32 v0; L: ds_read_addtid_b32 v0
+    {"lds_spill_target", "LDS", {0xb07c0000, 0xbf840002, 0xdac00000, 0x00000000, 0xdac40000, 0x00000000, 0xbf810000}},
+    // the spill, and ds_read_b32 v1, v0 (an address of the program's own)
+    {"lds_spill_shared",
+     "LDS",
+     {0xb07c0000, 0xdac00000, 0x00000000, 0xd8d80000, 0x01000000, 0xbf810000}},
 };
 
 } // namespace
