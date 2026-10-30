@@ -4749,6 +4749,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	                       vertex_program, ps_input_info, pixel_program, static_params,
 	                       m_driver_cache, native_bindings, FirstBuild(m_graphics));
 	const bool from_store = LastPipelineFromStore();
+	NotePlayCompile(from_store, create_begin);
 	m_render_pipelines++;
 	m_render_pipeline_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - create_begin).count();
 	MainPipelineDone();
@@ -4838,6 +4839,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
 	                       FirstBuild(m_graphics));
 	const bool from_store = LastPipelineFromStore();
+	NotePlayCompile(from_store, create_begin);
 	m_render_pipelines++;
 	m_render_pipeline_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - create_begin).count();
 	MainPipelineDone();

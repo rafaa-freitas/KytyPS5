@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -122,6 +123,46 @@ static int ControllerAxisValueFromSdl(int axis_id, int axis_value) {
 	           ? Controller::controller_get_axis(0, SDL_JOYSTICK_AXIS_MAX, axis_value)
 	           : Controller::controller_get_axis(SDL_JOYSTICK_AXIS_MIN, SDL_JOYSTICK_AXIS_MAX,
 	                                             axis_value);
+}
+
+// The sticks of a pad other than a PlayStation one, whose sticks rest a few percent off centre (more as they wear): a
+// round dead zone of KYTY_PAD_DEADZONE percent of the range (12 by default, 0 none), the rest stretched to the full
+// range. On an Xbox pad the character kept walking slowly after a run let go (issue #236). PlayStation pads are passed
+// as they are, to the game's own dead zone as on a PS5; so is the Steam Deck build's pad (Steam Input has one).
+static int PadDeadZonePercent() {
+	static const int percent = [] {
+#if defined(KYTY_STEAM_DECK)
+		const int fallback = 0;
+#else
+		const int fallback = 12;
+#endif
+		const char* value = std::getenv("KYTY_PAD_DEADZONE");
+		return value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 0, 50) : fallback;
+	}();
+	return percent;
+}
+
+// The stick of `axis_id` with the dead zone, both its axes set (PadDeadZonePercent); false: as it is.
+static bool SetStickWithDeadZone(int id, int axis_id) {
+	const int percent = PadDeadZonePercent();
+	if (percent == 0 || ControllerAxisIsTrigger(axis_id)) return false;
+	auto* pad = SDL_GameControllerFromInstanceID(id);
+	if (pad == nullptr) return false;
+	const auto type = SDL_GameControllerGetType(pad);
+	if (type == SDL_CONTROLLER_TYPE_PS3 || type == SDL_CONTROLLER_TYPE_PS4 || type == SDL_CONTROLLER_TYPE_PS5) return false;
+	const bool left   = axis_id == SDL_CONTROLLER_AXIS_LEFTX || axis_id == SDL_CONTROLLER_AXIS_LEFTY;
+	const auto axis_x = left ? SDL_CONTROLLER_AXIS_LEFTX : SDL_CONTROLLER_AXIS_RIGHTX;
+	const auto axis_y = left ? SDL_CONTROLLER_AXIS_LEFTY : SDL_CONTROLLER_AXIS_RIGHTY;
+	const double x = SDL_GameControllerGetAxis(pad, axis_x), y = SDL_GameControllerGetAxis(pad, axis_y);
+	const double radius = std::sqrt(x * x + y * y) / SDL_JOYSTICK_AXIS_MAX;
+	const double dead   = percent / 100.0;
+	const double scale  = radius <= dead ? 0.0 : std::min(1.0, (radius - dead) / (1.0 - dead)) / radius;
+	const auto   value  = [&](double v) {
+        return static_cast<int>(std::clamp(std::lround(v * scale), long {SDL_JOYSTICK_AXIS_MIN}, long {SDL_JOYSTICK_AXIS_MAX}));
+	};
+	Controller::SetAxis(id, ControllerAxisFromSdl(axis_x), ControllerAxisValueFromSdl(axis_x, value(x)));
+	Controller::SetAxis(id, ControllerAxisFromSdl(axis_y), ControllerAxisValueFromSdl(axis_y, value(y)));
+	return true;
 }
 
 struct EventMouse {
@@ -455,7 +496,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 
 	if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
-		if (axis != Controller::Axis::AxisMax) {
+		if (axis != Controller::Axis::AxisMax && !SetStickWithDeadZone(f.id, f.axis_id)) {
 			Controller::SetAxis(f.id, axis,
 			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}

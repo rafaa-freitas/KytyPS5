@@ -342,11 +342,13 @@ int main(int argc, char* argv[]) {
 	if (status) {
 		// (outdated: this GPU's and driver's, older than the seeds.)
 		const bool built = PipelineCache::StaticCacheCurrent(graphics, {});
-		std::printf("inputs %s\nstatic cache %s\n",
+		// (next precompile all: the store lacks a translation feature that changes nearly every shader, issue #246.)
+		std::printf("inputs %s\nstatic cache %s\nnext precompile %s\n",
 		            PipelineCache::StaticInputsCurrent(graphics, options.seeds) ? "current" : "stale",
 		            !built                                                     ? "stale"
 		            : PipelineCache::StaticCacheCurrent(graphics, options.seeds) ? "current"
-		                                                                         : "outdated");
+		                                                                         : "outdated",
+		            built && PipelineCache::StaticCacheRedoesAll() ? "all" : "new");
 		std::fflush(nullptr);
 		std::_Exit(0);
 	}

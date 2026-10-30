@@ -493,7 +493,11 @@ if ($Prompt -and ($offer -or !$tested)) {
 	if ($offer) {
 		$minutes = [math]::Ceiling(55 * 22 / $cpus / 10) * 10
 		$time = if ($minutes -lt 90) { "about $minutes minutes" } else { 'about {0:N1} hours' -f ($minutes / 60) }
-		$message = if ($cacheOutdated) {
+		# (next precompile all: the precompiled shaders lack a translation that changes nearly every shader, issue #246.)
+		$message = if ($cacheOutdated -and $status -match 'next precompile all') {
+			"$info`n`nThis version of the emulator translates the game's shaders differently from the one that made the precompiled shaders on this PC (a newer translation), so a precompile now compiles all of them again, once: $time on this PC, with the CPU fully loaded (closing its window stops it, and the next run continues).`n" +
+				"Until then the current precompiled shaders stay in use: starting the game now is fine."
+		} elseif ($cacheOutdated) {
 			"$info`n`nThis version of the emulator precompiles more of the game's shaders than the one that made the precompiled shaders on this PC: the new ones would stutter the first time they appear.`n" +
 				"Precompiling again compiles only what is new (minutes; at most $time on this PC, with the CPU fully loaded; closing its window stops it, and the next run continues)."
 		} else {

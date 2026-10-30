@@ -36,6 +36,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
@@ -635,6 +636,14 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	graphics.fragment_subgroup_reduction =
 	    bool(properties11.subgroupSupportedStages & vk::ShaderStageFlagBits::eFragment) &&
 	    (properties11.subgroupSupportedOperations & reductions) == reductions;
+	// (Quad operations in the fragment stage come with the quad feature: quadOperationsInAllStages is about the others.)
+	const bool fragment_quad =
+	    bool(properties11.subgroupSupportedStages & vk::ShaderStageFlagBits::eFragment) &&
+	    bool(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eQuad);
+	ShaderRecompiler::Spirv::SetPixelQuadOperations(fragment_quad);
+	if (!fragment_quad) {
+		std::printf("Vulkan subgroups: no quad operations in pixel shaders; their DPP quad moves as shuffles\n");
+	}
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;

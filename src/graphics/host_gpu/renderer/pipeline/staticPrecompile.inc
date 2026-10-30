@@ -1220,6 +1220,16 @@ bool PipelineCache::Precompile(GraphicContext& graphics, const PrecompileOptions
 	return cache.WarmSeeds(options, left_out);
 }
 
+// (This program translates with every feature of the GPU's: TranslatorFeatureSet() is what a precompile would use.)
+bool PipelineCache::StaticCacheRedoesAll() {
+	namespace Translate = ShaderRecompiler::Frontend;
+	std::error_code error;
+	const auto      exists = [&](const std::filesystem::path& path) { return std::filesystem::exists(path, error); };
+	if (!exists(StaticBinariesPath()) && !exists(StaticBlobsPath()) && !exists(StaticCachePath())) return false;
+	const auto broad = Translate::TranslatorFeatureSet() & Translate::TranslatorFeaturesBroad;
+	return (ReadStaticFeatures() & broad) != broad;
+}
+
 // Both files are saved whole (a temporary file renamed), so their first line tells the GPU and driver.
 bool PipelineCache::StaticCacheCurrent(GraphicContext& graphics, const std::filesystem::path& seeds) {
 	const bool blobs = StaticBlobsMode(graphics);

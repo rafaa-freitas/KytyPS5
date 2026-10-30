@@ -53,6 +53,7 @@ enum : uint32_t {
 	CapabilityGroupNonUniformArithmetic      = 63,
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
+	CapabilityGroupNonUniformQuad            = 68,
 	CapabilityShaderLayer                    = 69,
 	CapabilityShaderViewportIndex            = 70,
 	CapabilityDrawParameters                 = 4427,
@@ -287,6 +288,7 @@ enum : uint32_t {
 	OpGroupNonUniformBallotFindLSB = 343,
 	OpGroupNonUniformShuffle       = 345,
 	OpGroupNonUniformBitwiseOr     = 359,
+	OpGroupNonUniformQuadBroadcast = 365,
 };
 
 enum : uint32_t {

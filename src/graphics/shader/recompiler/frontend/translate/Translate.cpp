@@ -37,7 +37,8 @@ uint32_t TranslatorDeviceFeatures() {
 uint32_t TranslatorFeatureSet() {
 	// (KYTY_LANE_LOCAL_COOP=0/1: the cooperative halves off or on, KYTY_TABLE_SLOTS_AT_USE=0/1 the table slots' loads
 	// at the entry or where they are read, KYTY_NATIVE_FLOAT_MIN_MAX=0/1 the float min/max emulated or native, whatever
-	// the store was made with and the GPU allows; KYTY_EXEC_SELECTS=0/1 the EXEC selects kept or dropped.)
+	// the store was made with and the GPU allows; KYTY_EXEC_SELECTS=0/1 the EXEC selects kept or dropped;
+	// KYTY_UNFUSED_MAD=0/1 the multiply-adds fused or unfused.)
 	const auto forced = [](const char* name) {
 		const char* value = std::getenv(name);
 		return value == nullptr ? -1 : std::string_view(value) != "0" ? 1 : 0;
@@ -47,6 +48,8 @@ uint32_t TranslatorFeatureSet() {
 	static const int min_max      = forced("KYTY_NATIVE_FLOAT_MIN_MAX");
 	static const int exec_selects = forced("KYTY_EXEC_SELECTS");
 	static const int group_walks  = forced("KYTY_BDA_GROUP_WALKS");
+	static const int quad_reads   = forced("KYTY_PIXEL_QUAD_READS");
+	static const int unfused_mad  = forced("KYTY_UNFUSED_MAD");
 	const auto       stored       = g_translator_features.load(std::memory_order_relaxed);
 	auto             features     = (stored & g_device_features.load(std::memory_order_relaxed)) |
 	                     g_device_required.load(std::memory_order_relaxed);
@@ -58,6 +61,8 @@ uint32_t TranslatorFeatureSet() {
 	apply(min_max, TranslatorFeatureNativeFloatMinMax);
 	apply(exec_selects, TranslatorFeatureExecSelects);
 	apply(group_walks, TranslatorFeatureBdaGroupWalks);
+	apply(quad_reads, TranslatorFeaturePixelQuadReads);
+	apply(unfused_mad, TranslatorFeatureUnfusedMad);
 	return features;
 }
 

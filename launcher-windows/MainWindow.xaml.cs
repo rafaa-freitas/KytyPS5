@@ -422,6 +422,7 @@ partial class MainWindow : Window {
 			case StoreState.Checking: return T("shaders.checking");
 			case StoreState.Current: mark = Mark.Good; return T("shaders.current");
 			case StoreState.Outdated: mark = Mark.Warn; return T("shaders.outdated");
+			case StoreState.OutdatedAll: mark = Mark.Warn; return T("shaders.outdatedAll");
 			case StoreState.None: mark = Mark.Warn; return T("shaders.none");
 			default: return game.Found ? T("shaders.unknown") : null;
 		}
@@ -541,7 +542,8 @@ partial class MainWindow : Window {
 			UpdateOutputNote();
 		};
 		// The DLSS model (KYTY_DLSS_PRESET): the DLSS version's own choice, its transformer or its CNN model.
-		var models = new[] { new Choice(T("dlssmodel.auto"), ""), new Choice(T("dlssmodel.k"), "K"), new Choice(T("dlssmodel.e"), "E") };
+		var models = new[] { new Choice(T("dlssmodel.auto"), ""), new Choice(T("dlssmodel.k"), "K"), new Choice(T("dlssmodel.m"), "M"),
+		                     new Choice(T("dlssmodel.l"), "L"), new Choice(T("dlssmodel.e"), "E") };
 		dlssModel = Combo(models, Math.Max(0, Array.FindIndex(models, c => (string)c.Value == S.Str("dlss_preset"))));
 		dlssModel.IsEnabled = Value(upscaler) as string == "dlss";
 		// The upscaler's sharpening (KYTY_DLSS_SHARPNESS, KYTY_FSR_SHARPNESS): one row for the chosen upscaler, each with a
@@ -741,7 +743,7 @@ partial class MainWindow : Window {
 
 	void UpdateUpscalerNote() {
 		var chosen = upscaler == null ? S.Str("upscaler") : Value(upscaler) as string;
-		// (DLSS with FSR 3 frame generation: that runs without Streamline, so the emulator upscales with FSR 3 instead.)
+		// (DLSS with FSR 3 frame generation: DLSS upscales through Streamline, AMD's runtime generates past it.)
 		var fsrFrameGen = fsr != null ? fsr.IsChecked == true : context.FsrAvailable && S.Bool("fsr");
 		upscalerNote.Text = chosen == "fsr" ? T("upscaler.fsrNote")
 		                    : chosen == "off" ? T("upscaler.offNote")

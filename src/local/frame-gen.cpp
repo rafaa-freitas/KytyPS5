@@ -36,7 +36,10 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <mutex>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 #endif
 
@@ -450,6 +453,17 @@ CameraFrame Decompose(const std::array<float, 16>& m) {
 // image is then never written, the game black (issue #87).
 std::atomic<uint32_t> g_dlss_refusals {0};
 
+// How many times this error has come (its text after Streamline's time stamp and thread, "...[1066s:973ms:006us]").
+uint64_t ErrorRepeats(const char* message) {
+	std::string_view text(message);
+	if (const auto stamp = text.find("us]"); stamp != std::string_view::npos) text.remove_prefix(stamp + 3);
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, uint64_t> counts;
+	const uint64_t                                key = std::hash<std::string_view> {}(text);
+	std::lock_guard                               lock(mutex);
+	return ++counts[key];
+}
+
 void LogMessage(sl::LogType type, const char* message) {
 	LOGF("Streamline[%d]: %s", static_cast<int>(type), message);
 	if (type == sl::LogType::eError && message != nullptr && std::strstr(message, "[sl.dlss]") != nullptr &&
@@ -457,10 +471,19 @@ void LogMessage(sl::LogType type, const char* message) {
 		g_dlss_refusals.fetch_add(1, std::memory_order_relaxed);
 	// KYTY_FRAMEGEN_VERBOSE: every message on stdout (the run log), not only errors.
 	static const bool verbose = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr;
-	if (type == sl::LogType::eError || verbose) {
+	if (type != sl::LogType::eError && !verbose) return;
+	// The same error again: the first 3 printed, then every 1000th with its count. A tag Streamline refused every frame
+	// printed ~115 lines a second, each flushed from the thread that evaluates (issues #85, #129: 143,323 lines).
+	const uint64_t repeats = type == sl::LogType::eError && !verbose && message != nullptr ? ErrorRepeats(message) : 1;
+	if (repeats <= 3) {
 		std::printf("Streamline %s: %s", type == sl::LogType::eError ? "error" : "log", message);
-		std::fflush(stdout);
+		if (repeats == 3) std::printf("Streamline: that error 3 times; from now on every 1000th of it is printed\n");
+	} else if (repeats % 1000 == 0) {
+		std::printf("Streamline error (%" PRIu64 " times): %s", repeats, message);
+	} else {
+		return;
 	}
+	std::fflush(stdout);
 }
 
 template <typename F>
@@ -1244,7 +1267,8 @@ bool InputsGathered() {
 void BypassCommandHooks(vk::Device device) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// KYTY_FRAMEGEN_HOOKS=1 keeps Streamline's wrappers (for comparison).
-	if ((g_generate == 0 && !g_upscale) || g_fsr || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
+	// (Streamline not loaded: neither DLSS-G nor DLSS super resolution.)
+	if ((!g_upscale && (g_generate == 0 || g_fsr)) || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
 		return;
 	}
 	// The real loader: Streamline itself forwards to it.
@@ -1295,55 +1319,65 @@ void Initialize() {
 	}
 	if (const char* backend = std::getenv("KYTY_FRAMEGEN_BACKEND");
 	    !g_fsr_native && backend != nullptr && std::string(backend) == "fsr") {
-		// (No Streamline with FSR, so no DLSS super resolution either.)
-		g_upscale = false;
+		[] {
 #ifdef KYTY_FRAMEGEN_FSR
-		// AMD's runtime next to the emulator, only AMD's own; FSR 3.1 makes one frame per frame.
-		wchar_t exe[MAX_PATH] {};
-		GetModuleFileNameW(nullptr, exe, MAX_PATH);
-		const auto runtime = std::filesystem::path(exe).parent_path() / "amd_fidelityfx_vk.dll";
-		HMODULE    module  = nullptr;
-		if (!LocalPlatform::IsAmdSigned(runtime.wstring())) {
-			std::printf("Frame generation: %s is missing or not signed by AMD, FSR off\n", runtime.string().c_str());
-		} else {
-			module = LoadLibraryW(runtime.c_str());
-		}
-		if (module == nullptr) {
-			LOGF("frame generation: no FSR runtime (amd_fidelityfx_vk.dll)\n");
+			// AMD's runtime next to the emulator, only AMD's own; FSR 3.1 makes one frame per frame.
+			wchar_t exe[MAX_PATH] {};
+			GetModuleFileNameW(nullptr, exe, MAX_PATH);
+			const auto runtime = std::filesystem::path(exe).parent_path() / "amd_fidelityfx_vk.dll";
+			HMODULE    module  = nullptr;
+			if (!LocalPlatform::IsAmdSigned(runtime.wstring())) {
+				std::printf("Frame generation: %s is missing or not signed by AMD, FSR off\n", runtime.string().c_str());
+			} else {
+				module = LoadLibraryW(runtime.c_str());
+			}
+			if (module == nullptr) {
+				LOGF("frame generation: no FSR runtime (amd_fidelityfx_vk.dll)\n");
+				std::fflush(stdout);
+				g_generate = 0;
+				return;
+			}
+			ffxLoadFunctions(&g_fsr_state.api, module);
+			if (g_fsr_state.api.CreateContext == nullptr || g_fsr_state.api.Configure == nullptr ||
+			    g_fsr_state.api.Dispatch == nullptr || g_fsr_state.api.Query == nullptr ||
+			    g_fsr_state.api.DestroyContext == nullptr) {
+				std::printf("Frame generation: amd_fidelityfx_vk.dll lacks an entry point, FSR off\n");
+				g_generate = 0;
+				return;
+			}
+			ffxConfigureDescGlobalDebug1 debug {};
+			debug.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
+			debug.fpMessage   = FsrMessage;
+			debug.debugLevel  = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr ? FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_VERBOSE
+			                                                                    : FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_ERRORS;
+			(void)g_fsr_state.api.Configure(nullptr, &debug.header);
+			g_generate = 1;
+			g_fsr      = true;
+			LOGF("frame generation: FSR 3.1 runtime loaded from %s\n", runtime.string().c_str());
+			std::printf("Frame generation: AMD FSR 3.1 (2x)\n");
 			std::fflush(stdout);
-			g_generate = 0;
-			return;
-		}
-		ffxLoadFunctions(&g_fsr_state.api, module);
-		if (g_fsr_state.api.CreateContext == nullptr || g_fsr_state.api.Configure == nullptr ||
-		    g_fsr_state.api.Dispatch == nullptr || g_fsr_state.api.Query == nullptr || g_fsr_state.api.DestroyContext == nullptr) {
-			std::printf("Frame generation: amd_fidelityfx_vk.dll lacks an entry point, FSR off\n");
-			g_generate = 0;
-			return;
-		}
-		ffxConfigureDescGlobalDebug1 debug {};
-		debug.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
-		debug.fpMessage   = FsrMessage;
-		debug.debugLevel  = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr ? FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_VERBOSE
-		                                                                    : FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_ERRORS;
-		(void)g_fsr_state.api.Configure(nullptr, &debug.header);
-		g_generate = 1;
-		g_fsr      = true;
-		LOGF("frame generation: FSR 3.1 runtime loaded from %s\n", runtime.string().c_str());
-		std::printf("Frame generation: AMD FSR 3.1 (2x)\n");
-		std::fflush(stdout);
 #else
-		LOGF("frame generation: this build has no FSR support\n");
-		g_generate = 0;
+			LOGF("frame generation: this build has no FSR support\n");
+			g_generate = 0;
 #endif
-		return;
+		}();
+		// DLSS super resolution beside it (issue #244: an RTX 30 has no DLSS-G, so FSR's frame generation, which took FSR 3
+		// upscaling in DLSS's place): Streamline below with its DLSS plugin only. AMD's runtime makes its swapchain and
+		// presents through the Vulkan loader itself (vulkan-1.dll's imports), past Streamline. KYTY_FSR_FG_DLSS=0: FSR 3
+		// upscaling with it, as before.
+		static const bool with_dlss = [] {
+			const char* value = std::getenv("KYTY_FSR_FG_DLSS");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (!with_dlss) g_upscale = false;
+		if (!g_upscale) return;
 	}
-	// (Every way out without Streamline turns both off.)
+	// (Every way out without Streamline turns both off, AMD's frame generation aside.)
 	struct Off {
 		bool done = false;
 		~Off() {
 			if (!done) {
-				if (!g_fsr_native) g_generate = 0;
+				if (!g_fsr_native && !g_fsr) g_generate = 0;
 				g_upscale = false;
 			}
 		}
@@ -1416,8 +1450,8 @@ void Initialize() {
 	static const wchar_t*     plugin_paths[] {plugin_dir.c_str()};
 	// KYTY_FRAMEGEN_FEATURES=dlssg,reflex,pcl: the plugins to load (a diagnostic subset).
 	static std::vector<sl::Feature> features;
-	if (g_generate > 0) features = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
-	if (const char* list = std::getenv("KYTY_FRAMEGEN_FEATURES"); list != nullptr && g_generate > 0) {
+	if (g_generate > 0 && !g_fsr) features = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
+	if (const char* list = std::getenv("KYTY_FRAMEGEN_FEATURES"); list != nullptr && g_generate > 0 && !g_fsr) {
 		const std::string text = list;
 		features.clear();
 		if (text.find("dlssg") != std::string::npos) features.push_back(sl::kFeatureDLSS_G);

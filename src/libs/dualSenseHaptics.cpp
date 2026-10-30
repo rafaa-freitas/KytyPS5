@@ -129,6 +129,10 @@ float      g_vibration_motor_gain  = 2.0f;
 // reads as a hit that keeps rumbling (and a whole spell charge as one long one).
 uint32_t   g_vibration_motor_ms    = 60;
 float      g_vibration_motor_decay = 0.6f;
+// The game's own level (before the vibration gain) a block needs to drive the motors: a quiet effect the game keeps
+// playing stays on the actuators, as on a PS5. An enchanted weapon's hum (0.005-0.01, the whole buff long) rumbled
+// until the buff ran out (issue #239); hits reach 0.25. KYTY_DUALSENSE_VIBRATION_MOTOR_ONSET.
+float      g_vibration_motor_onset = 0.025f;
 
 // What the routes actually did, so a log can tell clipping from silence and from a stalled endpoint.
 uint64_t   g_speaker_writes        = 0;
@@ -247,6 +251,13 @@ void ReadSettings() {
 			g_vibration_motor_decay = decay;
 		}
 	}
+	// KYTY_DUALSENSE_VIBRATION_MOTOR_ONSET=<0..1>: the game's level a block needs to drive the motors (0: any).
+	if (const char* value = std::getenv("KYTY_DUALSENSE_VIBRATION_MOTOR_ONSET"); value != nullptr) {
+		const auto onset = std::strtof(value, nullptr);
+		if (onset >= 0.0f && onset <= 1.0f) {
+			g_vibration_motor_onset = onset;
+		}
+	}
 	// KYTY_DUALSENSE_SPEAKER_CHANNELS=01|23|all and KYTY_DUALSENSE_SPEAKER_GAIN=<float>: which
 	// channels the pad speaker port plays on (0-1 by default, as the mainline and this module's
 	// first version do) and how much level it gets. Both keep the pad's USB id selection.
@@ -291,10 +302,11 @@ void ReadSettings() {
 
 	// The settings actually in use, once: the values the routes and the motors run with.
 	std::printf("DualSense: settings: %s, vibration gain %.2f on channels %u-%u, motors %.2f (%u ms, "
-	            "decay %.2f), speaker gain %.2f on channels %u-%u, preamp %s, volume %u, limiter %s%s\n",
+	            "decay %.2f, onset %.3f), speaker gain %.2f on channels %u-%u, preamp %s, volume %u, limiter %s%s\n",
 	            g_enabled ? "on" : "off", static_cast<double>(g_gain), g_first_channel,
 	            g_first_channel + g_channel_count - 1u, static_cast<double>(g_vibration_motor_gain),
 	            g_vibration_motor_ms, static_cast<double>(g_vibration_motor_decay),
+	            static_cast<double>(g_vibration_motor_onset),
 	            static_cast<double>(g_speaker_gain),
 	            g_speaker_first_channel, g_speaker_first_channel + g_speaker_channel_count - 1u,
 	            g_speaker_preamp ? "on (+6 dB)" : "off", g_speaker_volume,
@@ -622,6 +634,10 @@ void RumbleFromHaptics(float left, float right) {
 	// three blocks.
 	constexpr float FLOOR = 0.01f;
 	static float    held[2] = {0.0f, 0.0f};
+	// (Under the onset a block only lets the hold fall: the peaks here carry the vibration gain.)
+	const float onset = g_vibration_motor_onset * g_gain;
+	left              = left >= onset ? left : 0.0f;
+	right             = right >= onset ? right : 0.0f;
 	held[0] = std::max(std::max(left, 0.0f), held[0] * g_vibration_motor_decay);
 	held[1] = std::max(std::max(right, 0.0f), held[1] * g_vibration_motor_decay);
 	const bool live = held[0] >= FLOOR || held[1] >= FLOOR;

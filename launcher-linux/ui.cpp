@@ -790,6 +790,7 @@ void LauncherWindow::PlayPage() {
 			case StoreState::Checking: check(Mark::Busy, T("shaders.checking")); break;
 			case StoreState::Current: check(Mark::Good, T("shaders.current")); break;
 			case StoreState::Outdated: check(Mark::Warn, T("shaders.outdated")); break;
+			case StoreState::OutdatedAll: check(Mark::Warn, T("shaders.outdatedAll")); break;
 			case StoreState::None: check(Mark::Warn, T("shaders.none")); break;
 			default:
 				if (game_.Found()) check(Mark::Busy, T("shaders.unknown"));
@@ -1107,18 +1108,18 @@ void LauncherWindow::GraphicsPage() {
 	             ? " " + std::string(T("output.1440NoUpscaler"))
 	             : ""));
 
-	// The DLSS model (KYTY_DLSS_PRESET): the DLSS version's own choice, its transformer or its CNN
-	// model.
-	const std::vector<std::string> presets {"", "K", "E"};
+	// The DLSS model (KYTY_DLSS_PRESET): the DLSS version's own choice, its transformer (K; DLSS 4.5's M and L) or
+	// its CNN model.
+	const std::vector<std::string> presets {"", "K", "M", "L", "E"};
 	Row(
 	    "dlssmodel",
 	    [&] {
 		    int index =
 		        static_cast<int>(std::find(presets.begin(), presets.end(), S().Str("dlss_preset")) -
 		                         presets.begin());
-		    if (index >= 3) index = 0;
+		    if (index >= 5) index = 0;
 		    if (Combo("##dlssmodel", &index,
-		              {T("dlssmodel.auto"), T("dlssmodel.k"), T("dlssmodel.e")}, 300,
+		              {T("dlssmodel.auto"), T("dlssmodel.k"), T("dlssmodel.m"), T("dlssmodel.l"), T("dlssmodel.e")}, 300,
 		              commands_.Dlss())) {
 			    S().Set("dlss_preset", presets[static_cast<size_t>(index)]);
 			    Changed();
@@ -1285,6 +1286,7 @@ void LauncherWindow::ShadersPage() {
 		case StoreState::Checking: state = "shaders.checking"; break;
 		case StoreState::Current: state = "shaders.current"; break;
 		case StoreState::Outdated: state = "shaders.outdated"; break;
+		case StoreState::OutdatedAll: state = "shaders.outdatedAll"; break;
 		case StoreState::None: state = "shaders.none"; break;
 		default: state = game_.Found() ? "shaders.unknown" : "cheats.noGame"; break;
 	}

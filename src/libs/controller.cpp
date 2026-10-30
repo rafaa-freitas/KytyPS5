@@ -940,12 +940,24 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 // PadSetVibration, so an Xbox controller never vibrated (issue #236). Each channel's peak (left the large motor, right
 // the small one) is held with a decay, as the DualSense on Bluetooth's motors are (dualSenseHaptics.cpp
 // RumbleFromHaptics: x0.6 per 21.3 ms, so a single hit ends in ~250 ms and hits in consecutive blocks join), and the
-// motors are set once per 1024 frames (21.3 ms at 48 kHz). KYTY_PAD_RUMBLE_GAIN=<0..16> scales the drive (2 by
-// default, the DualSense motors' reference; 0 leaves the motors alone).
+// motors are set once per 1024 frames (21.3 ms at 48 kHz). KYTY_PAD_RUMBLE_GAIN=<0..16> scales the drive (1 by
+// default: an Xbox pad's motors at the DualSense's reference 2 were too strong even at 1, issue #236; 0 leaves the
+// motors alone). KYTY_PAD_RUMBLE_ONSET=<0..1>: the level a block
+// needs to drive them (0.025, as the DualSense's: a quiet effect the game keeps playing, an enchanted weapon's hum at
+// 0.005-0.01, rumbled the whole buff long, issue #239; hits reach 0.25).
 void RumbleFromVibrationAudio(const void* data, uint32_t frames, uint32_t channels, bool is_float, const float* gains) {
 	static const float gain = [] {
 		const char* value = std::getenv("KYTY_PAD_RUMBLE_GAIN");
-		return value != nullptr && *value != 0 ? std::clamp(std::strtof(value, nullptr), 0.0f, 16.0f) : 2.0f;
+#if defined(KYTY_STEAM_DECK)
+		constexpr float fallback = 2.0f; // (the Deck's own motors are weak)
+#else
+		constexpr float fallback = 1.0f;
+#endif
+		return value != nullptr && *value != 0 ? std::clamp(std::strtof(value, nullptr), 0.0f, 16.0f) : fallback;
+	}();
+	static const float onset = [] {
+		const char* value = std::getenv("KYTY_PAD_RUMBLE_ONSET");
+		return value != nullptr && *value != 0 ? std::clamp(std::strtof(value, nullptr), 0.0f, 1.0f) : 0.025f;
 	}();
 	if (gain == 0.0f || data == nullptr || frames == 0 || channels == 0 || g_controller == nullptr) {
 		return;
@@ -974,7 +986,7 @@ void RumbleFromVibrationAudio(const void* data, uint32_t frames, uint32_t channe
 	pending = 0;
 	const bool was_live = held[0] != 0.0f || held[1] != 0.0f;
 	for (int m = 0; m < 2; m++) {
-		held[m] = std::max(peak[m], held[m] * DECAY);
+		held[m] = std::max(peak[m] >= onset ? peak[m] : 0.0f, held[m] * DECAY);
 		peak[m] = 0.0f;
 	}
 	if (held[0] < FLOOR && held[1] < FLOOR) {

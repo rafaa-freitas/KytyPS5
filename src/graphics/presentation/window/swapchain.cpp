@@ -540,11 +540,37 @@ struct Presenter::Impl {
 		hud.status_fraction = static_cast<float>(progress.done) / static_cast<float>(progress.total);
 	}
 
+	// With the panel on, a note while the render thread compiles pipelines the precompiled set does not have (a first
+	// use's stutter: issue #129 asked for it, as RPCS3 shows its shader compiles), and for 3 s after: how many in that
+	// run of them and how long they took.
+	PipelineCache::PlayCompiles           play_seen {}, play_shown {};
+	std::chrono::steady_clock::time_point play_last {};
+	void AddCompileNote(std::chrono::steady_clock::time_point now, int level) {
+		const auto made = renderer.GetPipelineCache().GetPlayCompiles();
+		if (made.count != play_seen.count) {
+			if (now - play_last > std::chrono::seconds(3)) play_shown = {};
+			play_shown.count += made.count - play_seen.count;
+			play_shown.us += made.us - play_seen.us;
+			play_seen = made;
+			play_last = now;
+		}
+		if (level == 0 || play_shown.count == 0 || now - play_last > std::chrono::seconds(3)) return;
+		std::array<char, 96> line {};
+		std::snprintf(line.data(), line.size(), "Compiling shaders: %llu (%.1f s)", static_cast<unsigned long long>(play_shown.count),
+		              static_cast<double>(play_shown.us) / 1e6);
+		hud.notice += hud.notice.empty() ? line.data() : std::string("\n") + line.data();
+	}
+
 	[[nodiscard]] SystemOverlayHud* UpdateHud(bool reuse) {
 		const int  level = PerfOverlay::Level();
 		const auto now   = std::chrono::steady_clock::now();
 		UpdateStatus(now);
 		hud.notice = Loader::DemonsSoulsWarp::HudText();
+		AddCompileNote(now, level);
+		if (now.time_since_epoch().count() < present_wait_until.load(std::memory_order_relaxed)) {
+			const char* text = "Presents held by the driver: NVIDIA Low Latency Mode Ultra?\nSet it to Off or On for kyty_emulator.exe";
+			hud.notice += hud.notice.empty() ? std::string(text) : std::string("\n") + text;
+		}
 		if (level < 2) {
 			// (Switched down from detailed with F8: its rows go.)
 			hud.perf.rows.clear();
@@ -638,6 +664,9 @@ struct Presenter::Impl {
 		std::atomic<uint64_t> handed {0}, presented {0}, replaced {0}, not_due {0}, present_us {0}, present_max_us {0};
 		std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
 	} present_stats;
+	// Presents held by the driver (NotePresentCall): noted once; the notice on the game until then (steady_clock ticks).
+	bool                 present_wait_noted = false;
+	std::atomic<int64_t> present_wait_until {0};
 	// Presenter::RequestSwapchainRecreate (the window's thread) for the present thread's next frame.
 	std::atomic<bool> recreate_requested {false};
 	void NotePresentCall(std::chrono::steady_clock::duration took) {
@@ -652,6 +681,20 @@ struct Presenter::Impl {
 		const uint64_t not_due = st.not_due.exchange(0), total_us = st.present_us.exchange(0), max_us = st.present_max_us.exchange(0);
 		const double   seconds = std::chrono::duration<double>(now - st.since).count();
 		st.since               = now;
+		// NVIDIA's Low Latency Mode Ultra holds the present call (VSync off: 2.7-6.3 ms on average against 0.4 with it Off
+		// or On, frames lost, the frame times uneven: issue #129). Vulkan cannot read the driver's setting, so by the
+		// symptom, once a session: a log line and a notice on the game for 20 s. (Not with frame generation, whose
+		// presents pace themselves.)
+		if (const double average_ms = presented != 0 ? static_cast<double>(total_us) / 1000.0 / static_cast<double>(presented) : 0.0;
+		    !present_wait_noted && presented >= 300 && average_ms >= 2.0 && !swapchain.IsFifo() && !FrameGen::Enabled() &&
+		    renderer.GetGraphics().GetPhysicalDeviceProperties().vendorID == 0x10de) {
+			present_wait_noted = true;
+			std::printf("Presenter: each present waited %.1f ms on average with VSync off: NVIDIA's Low Latency Mode Ultra does "
+			            "that (frames are lost); set Low Latency Mode to Off or On for kyty_emulator.exe in the NVIDIA "
+			            "Control Panel (issue #129)\n",
+			            average_ms);
+			present_wait_until.store((now + std::chrono::seconds(20)).time_since_epoch().count(), std::memory_order_relaxed);
+		}
 		if (replaced + not_due == 0 && max_us < 50000) return;
 		std::printf("Presenter: %.0f s: %llu frames handed over, %llu presented, %llu replaced while waiting, %llu not due; "
 		            "the present call %.2f ms on average, at most %.1f ms\n",
@@ -1184,6 +1227,14 @@ void Swapchain::Destroy() {
 	}
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
+	}
+	// FSR 3's frame generation swapchain presents from its own thread and queues, which the waits above do not cover:
+	// its frames may still wait on the semaphores and read the images' views below. Its context goes first (its
+	// destruction waits for its own work), then those. (An RTX 2060 SUPER on a 165 Hz display lost the device leaving
+	// full screen with F11, issue #174; never on an RTX 5090 at 60 Hz.)
+	if (m_handle != nullptr && FrameGen::OwnsSwapchain()) {
+		FrameGen::DestroySwapchain(graphics, m_handle);
+		m_handle = nullptr;
 	}
 
 	for (const auto semaphore: m_image_acquired) {

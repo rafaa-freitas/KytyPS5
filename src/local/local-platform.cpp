@@ -660,6 +660,11 @@ uint32_t g_follow_window = 1024, g_follow_threads = 16;
 // an order of its own, and windows of files it read a moment before opened again those just closed (25-60 thousand
 // opens a minute through a tour of four worlds, 45-90 thousand files open at once).
 constexpr uint64_t FollowAgainMs = 5 * 60 * 1000;
+// The files kept open at most before the openers stop opening ahead (the game's own opens are never held back). A
+// player's loads stuck in the fog for good after a world change with 64,481 files open, about 2^16 (the game's folder
+// on a drive whose file system or driver takes no more, it seems), and went through with the read-ahead off (issue
+// #249); this desktop peaked at 42 thousand. Lowered when an open of the game's fails (CloseFilesOpenedAhead).
+std::atomic<size_t> g_kept_open_max {48 * 1024};
 
 void FollowOpenThread() {
 	SetThreadName("Kyty.FileOpen");
@@ -674,7 +679,7 @@ void FollowOpenThread() {
 		}
 		{
 			const std::lock_guard lock(g_kept_files_mutex);
-			if (g_kept_files.contains(path)) continue;
+			if (g_kept_files.contains(path) || g_kept_files.size() >= g_kept_open_max.load(std::memory_order_relaxed)) continue;
 		}
 		const auto wide = WidePath(path);
 		if (wide.empty()) continue;
@@ -786,6 +791,40 @@ void FollowFrom(const std::string& path) {
 	if (any) g_follow.ready.notify_all();
 }
 
+// An open of the game's failed for want of something other than the file (issue #249: the loads of a player whose
+// drive seems to take about 2^16 open files stopped): the files opened ahead and not read yet close, the openers keep
+// at most three quarters of what was open from then on, and the first few such failures go in the log. The number
+// closed (0: none to give back).
+size_t CloseFilesOpenedAhead(const std::string& path, DWORD error) {
+	std::vector<HANDLE> handles;
+	size_t              open = 0;
+	{
+		const std::lock_guard lock(g_kept_files_mutex);
+		open = g_kept_files.size();
+		for (auto it = g_kept_files.begin(); it != g_kept_files.end();) {
+			if (it->second.ahead && it->second.readers == 0) {
+				handles.push_back(it->second.handle);
+				it = g_kept_files.erase(it);
+			} else {
+				++it;
+			}
+		}
+		g_kept_open_max.store(std::min(g_kept_open_max.load(std::memory_order_relaxed), std::max<size_t>(open * 3 / 4, 1024)),
+		                      std::memory_order_relaxed);
+	}
+	for (const auto handle: handles)
+		CloseHandle(handle);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 5) {
+		std::printf("Files: opening %s failed (error %lu) with %zu files open: %zu opened ahead closed, the read-ahead keeps at "
+		            "most %zu open from now on (issue #249)\n",
+		            path.c_str(), static_cast<unsigned long>(error), open, handles.size(),
+		            g_kept_open_max.load(std::memory_order_relaxed));
+		std::fflush(stdout);
+	}
+	return handles.size();
+}
+
 uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size) {
 	{
 		std::unique_lock lock(g_kept_files_mutex);
@@ -804,9 +843,18 @@ uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size) {
 	// read of a file kept open already (an audio stream's next piece) waited for them behind it (open=150-250 ms).
 	const auto wide = WidePath(path);
 	if (wide.empty()) return 0;
-	HANDLE handle = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-	                            FILE_ATTRIBUTE_NORMAL, nullptr);
-	if (handle == INVALID_HANDLE_VALUE) return 0;
+	const auto open = [&] {
+		return CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+		                   FILE_ATTRIBUTE_NORMAL, nullptr);
+	};
+	HANDLE handle = open();
+	if (handle == INVALID_HANDLE_VALUE) {
+		// (Not for a file that is not there: the game asks for some.)
+		if (const DWORD error = GetLastError();
+		    error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND && CloseFilesOpenedAhead(path, error) != 0)
+			handle = open();
+		if (handle == INVALID_HANDLE_VALUE) return 0;
+	}
 	LARGE_INTEGER length {};
 	if (GetFileSizeEx(handle, &length) == 0) {
 		CloseHandle(handle);
@@ -846,6 +894,9 @@ void FollowKeptFiles(const std::string& recording, const std::string& root) {
 			g_follow_window = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 65536u);
 		if (const char* value = std::getenv("KYTY_FILE_FOLLOW_THREADS"); value != nullptr && *value != '\0')
 			g_follow_threads = std::clamp(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 64u);
+		// KYTY_FILE_OPEN_MAX=<n>: the files kept open before the openers stop (g_kept_open_max).
+		if (const char* value = std::getenv("KYTY_FILE_OPEN_MAX"); value != nullptr && *value != '\0')
+			g_kept_open_max.store(std::max<size_t>(std::strtoull(value, nullptr, 10), 256), std::memory_order_relaxed);
 		std::lock_guard lock(g_follow.mutex);
 		g_follow.root = root;
 		if (!g_follow.root.empty() && g_follow.root.back() != '/' && g_follow.root.back() != '\\') g_follow.root += '/';
