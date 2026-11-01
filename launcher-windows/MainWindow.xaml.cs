@@ -36,14 +36,16 @@ partial class MainWindow : Window {
 		{ "21:9", new[] { "2560x1080", "3440x1440", "3840x1600", "5120x2160" } },
 		{ "32:9", new[] { "3840x1080", "5120x1440", "7680x2160" } },
 	};
-	// The height Demon's Souls renders its 3D at (run-windows.ps1 -RenderHeight); its output and UI stay 3840x2160.
-	static readonly int[] RenderHeights = { 2160, 1800, 1620, 1512, 1440, 1296, 1152, 1080, 900, 720 };
+	// The height Demon's Souls renders its 3D at (run-windows.ps1 -RenderHeight); its output and UI stay 3840x2160. The
+	// upscalers' usual shares among them (issue #129): Ultra Quality 77% (1664 of 4K, 832 of 1080p), Quality 66.7%
+	// (1440), Balanced 58% (1256), Performance 50% (1080), Ultra Performance 33% (720).
+	static readonly int[] RenderHeights = { 2160, 1800, 1664, 1620, 1512, 1440, 1296, 1256, 1152, 1080, 900, 832, 720 };
 	// Below 720 with the 1080p output only (issue #129): DLSS's Balanced, Performance and Ultra Performance there; the
 	// game's TAA down to 540 (from 360 its picture is too soft).
 	static readonly int[] LowRenderHeights = { 630, 540, 360 };
-	// The 1440p output's (DLSS or FSR 3, PR #165): DLAA, Quality, Balanced 840, Performance 720, Ultra Performance 480 (its
-	// third; the emulator raises a height between the third and the half to the half).
-	static readonly int[] Output1440Heights = { 1440, 1152, 1080, 960, 840, 720, 480 };
+	// The 1440p output's (DLSS or FSR 3, PR #165): DLAA, Ultra Quality 1104, Quality 960, Balanced 840, Performance 720,
+	// Ultra Performance 480 (its third; the emulator raises a height between the third and the half to the half).
+	static readonly int[] Output1440Heights = { 1440, 1152, 1104, 1080, 960, 840, 720, 480 };
 
 	// (--screenshot pictures: no game art, another path shown.)
 	public static bool ScreenshotNoArt;
@@ -67,8 +69,8 @@ partial class MainWindow : Window {
 	ComboBox resolution, ratio, render, upscaler, dlssModel, sharpness, output, quality, frameGen, language, audioOutput, hud, uiLanguage, gpu;
 	// The Sharpening row's value for each upscaler ("0" to "0.9"), and the upscaler whose value it shows.
 	string dlssSharpness = "0", fsrSharpness = "0.6", sharpnessShown = "";
-	CheckBox fullscreen, aspect, hdr, fps120, vsync, lowLatency, fsr, cheats, redzone, safeGpu, ecores, presentDirect, vrrFlips, antiLag,
-		keepResident, fps30, padSpeaker, reopenLauncher;
+	CheckBox fullscreen, aspect, wideBars, hdr, fps120, vsync, lowLatency, fsr, cheats, redzone, safeGpu, ecores, presentDirect, vrrFlips,
+		antiLag, keepResident, fps30, padSpeaker, reopenLauncher, skipLogos;
 	TextBlock renderNote, outputNote, upscalerNote, frameGenNote, streamlineText, cheatState, bannerTitle, bannerLine, storeLine;
 	Image banner;
 	Border bannerFallback;
@@ -440,8 +442,11 @@ partial class MainWindow : Window {
 			WindowChanged();
 		};
 		UpdateResolutions(S.Str("resolution"));
+		// (With 21:9 or 32:9 only: the movies and menus at 16:9 between black bars, Commands.)
+		wideBars = Switch(S.Bool("wide_bars"), Ratio() != "16:9");
 		ratio.SelectionChanged += (s, e) => {
 			if (building) return;
+			wideBars.IsEnabled = Ratio() != "16:9";
 			UpdateResolutions(Value(resolution) as string ?? S.Str("resolution"));
 			SelectRenderHeight();
 			UpdateRenderNote();
@@ -465,6 +470,7 @@ partial class MainWindow : Window {
 			Section("display.window"),
 			Row("resolution", resolution, Desc(T("resolution.desc"))),
 			Row("ratio", ratio, Desc(T("ratio.desc"))),
+			Row("widebars", wideBars, Desc(T("widebars.desc"))),
 			Row("fullscreen", fullscreen),
 			Row("aspect", aspect, Desc(T("aspect.desc"))),
 			Row("hdr", hdr, Desc(T("hdr.desc"))),
@@ -662,12 +668,13 @@ partial class MainWindow : Window {
 	}
 
 	// The DLSS mode a render height runs in: the emulator picks it from the height's share of the game's output
-	// (frame-gen.cpp: 95% DLAA, 62% Quality, 55% Balanced, 45% Performance, less Ultra Performance).
+	// (frame-gen.cpp: 95% DLAA, 62% Quality, 55% Balanced, 45% Performance, less Ultra Performance). From 72% it is named
+	// Ultra Quality (77% the usual share), DLSS's Quality mode with more lines.
 	string SuperResolutionMode(int height) {
 		var share = (double)height / OutputLines;
 		// (FSR 3 names the same modes; at the output's own size it is FSR's native anti-aliasing.)
 		var native = upscaler != null && Value(upscaler) as string == "fsr" ? "fsr.native" : "dlss.dlaa";
-		return T(share >= 0.95 ? native : share >= 0.62 ? "dlss.quality" : share >= 0.55 ? "dlss.balanced" : share >= 0.45 ? "dlss.performance" : "dlss.ultra");
+		return T(share >= 0.95 ? native : share >= 0.72 ? "dlss.ultraquality" : share >= 0.62 ? "dlss.quality" : share >= 0.55 ? "dlss.balanced" : share >= 0.45 ? "dlss.performance" : "dlss.ultra");
 	}
 
 	// The highest render height whose 3D at the ratio fits the game's render target memory, made for 3840x2160: no more of
@@ -781,10 +788,13 @@ partial class MainWindow : Window {
 		choose.Margin = new Thickness(16, 0, 0, 0);
 		cheatState = new TextBlock { Foreground = Res<Brush>("TextDimBrush"), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(14, 0, 0, 0) };
 		padSpeaker = Switch(S.Bool("pad_speaker"));
+		// The game's own switch for its start-up logos (KYTY_SKIP_LOGOS, issue #263).
+		skipLogos = Switch(S.Bool("skip_logos"));
 		return Page("game.title",
 			Section("game.console"),
 			Row("language", language, Desc(T("language.desc"))),
 			Row("audiooutput", audioOutput, Desc(T("audiooutput.desc"))),
+			Row("skiplogos", skipLogos, Desc(T("skiplogos.desc"))),
 			Section("game.controller"),
 			Row("padspeaker", padSpeaker, Desc(T("padspeaker.desc"))),
 			Row("padvolume", SliderRow(0, 100, 5, S.Int("pad_speaker_volume"),
@@ -956,6 +966,7 @@ partial class MainWindow : Window {
 		if (res != null) S.Set("resolution", res);
 		S.Set("fullscreen", fullscreen.IsChecked == true);
 		S.Set("aspect", aspect.IsChecked == true);
+		S.Set("wide_bars", wideBars.IsChecked == true);
 		S.Set("language", Math.Max(0, language.SelectedIndex));
 		S.Set("redzone", redzone.IsChecked == true);
 		S.Set("fps120", fps120.IsChecked == true);
@@ -981,6 +992,7 @@ partial class MainWindow : Window {
 		S.Set("dlss_sharpness", dlssSharpness == "0" ? "" : dlssSharpness);
 		S.Set("fsr_sharpness", fsrSharpness == "0.6" ? "" : fsrSharpness);
 		S.Set("audio_output", Value(audioOutput) as string ?? "");
+		S.Set("skip_logos", skipLogos.IsChecked == true);
 		S.Set("gpu", Value(gpu) as string ?? "");
 		if (context.FsrAvailable) S.Set("fsr", fsr.IsChecked == true);
 		S.Set("ecores", ecores.IsChecked == true);
@@ -1017,6 +1029,7 @@ partial class MainWindow : Window {
 		else if (S.Bool("fps120")) options.Add(T("summary.fps120"));
 		if (S.Bool("lowlatency")) options.Add(T("lowlatency"));
 		if (S.Bool("hdr")) options.Add(T("summary.hdr"));
+		if (S.Bool("wide_bars") && S.Str("ratio") != "16:9") options.Add(T("summary.wideBars"));
 		if (hdOutput) options.Add(T("summary.hd"));
 		if (output1440) options.Add(T("summary.1440"));
 		if (S.Bool("present_direct")) options.Add(T("summary.presentDirect"));
@@ -1024,6 +1037,7 @@ partial class MainWindow : Window {
 		if (S.Bool("antilag")) options.Add(T("summary.antilag"));
 		if (S.Bool("keep_resident")) options.Add(T("summary.keepResident"));
 		if (!S.Bool("pad_speaker")) options.Add(T("summary.padSpeakerOff"));
+		if (S.Bool("skip_logos")) options.Add(T("summary.skipLogos"));
 		if (S.Str("extra_args").Length != 0) options.Add(T("summary.extra"));
 
 		var parts = new List<string> {

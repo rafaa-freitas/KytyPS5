@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "loader/demonsSoulsHdOutput.h"
+#include "loader/demonsSoulsRenderSize.h"
 
 #include <algorithm>
 #include <atomic>
@@ -119,6 +120,10 @@ uint64_t g_guest_frame = 0;     // Kyty.Gpu
 std::atomic<bool> g_scene {false}; // the current guest frame ran the TAA pass
 std::atomic<bool> g_last_scene {false}; // ... the last one the guest flipped
 std::atomic<uint64_t> g_flips_taken {0}; // TakeScene calls (guest flips)
+std::atomic<uint64_t> g_drawn_at_flip {0}; // the guest's indexed draw packets when TakeScene last ran
+std::atomic<bool> g_menu {false}; // the current guest frame drew a menu (NoteMenu)
+std::atomic<int> g_menu_hold {0}; // flips still to go in the middle after the last that drew a menu (TakeMenu)
+std::atomic<bool> g_centred {false}; // the current guest frame's interface went to the middle (NoteCentred)
 // Why the last frame had no inputs (PrepareInputs; the on/off lines' reason): 0 it had them, 1 no TAA pass, 2 no camera,
 // 3 the TAA's images replaced since.
 std::atomic<uint32_t> g_inputs_missing {0};
@@ -621,18 +626,22 @@ FsrCamera FsrDecompose(const std::array<float, 16>& m) {
 	return c;
 }
 
+// Frame generation off on the swapchain: it then presents the frames as they are (before either goes).
+void FsrStopFrameGeneration() {
+	auto& s = g_fsr_state;
+	if (s.fg_context == nullptr || s.swapchain == nullptr) return;
+	ffxConfigureDescFrameGeneration config {};
+	config.header.type            = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+	config.swapChain              = static_cast<VkSwapchainKHR>(s.swapchain);
+	config.frameGenerationEnabled = false;
+	config.frameID                = ++s.frame_id;
+	(void)s.api.Configure(&s.fg_context, &config.header);
+}
+
 void FsrDestroyFrameGeneration() {
 	auto& s = g_fsr_state;
 	if (s.fg_context == nullptr) return;
-	if (s.swapchain != nullptr) {
-		// (Off before its context goes: the swapchain then presents the frames as they are.)
-		ffxConfigureDescFrameGeneration config {};
-		config.header.type            = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
-		config.swapChain              = static_cast<VkSwapchainKHR>(s.swapchain);
-		config.frameGenerationEnabled = false;
-		config.frameID                = ++s.frame_id;
-		(void)s.api.Configure(&s.fg_context, &config.header);
-	}
+	FsrStopFrameGeneration();
 	(void)s.api.DestroyContext(&s.fg_context, nullptr);
 	s.fg_context = nullptr;
 	s.mode_on    = false;
@@ -674,13 +683,17 @@ bool FsrEnsureFrameGeneration(vk::Extent2D render) {
 
 #ifdef KYTY_FRAMEGEN_FSR_HUD
 // The game's interface canvas (NoteUiCanvas: its guest address; the GPU thread's): 3840x2160, the HD output's
-// 1920x1080, or KYTY_OUTPUT_HEIGHT's output where the interface is scaled to it (loader/demonsSoulsHdOutput.h).
+// 1920x1080, or KYTY_OUTPUT_HEIGHT's output where the interface is scaled to it (loader/demonsSoulsHdOutput.h). With
+// the wide output (KYTY_RENDER_ASPECT) as wide as that output: 5120x1440 at 32:9 and 1440, where FSR looked for a
+// 2560x1440 canvas, found none and generated the HUD too, which ghosted (issue #250).
 std::atomic<uint64_t> g_ui_canvas {0};
 
 vk::Extent2D UiCanvasExtent() {
 	namespace Hd = ::Loader::DemonsSoulsHdOutput;
-	if (Hd::InterfaceScaled() || Hd::InterfaceAtOutput()) return vk::Extent2D {Hd::UpscaledWidth(), Hd::UpscaledHeight()};
-	return Hd::Active() ? vk::Extent2D {Hd::HdWidth, Hd::HdHeight} : vk::Extent2D {3840, 2160};
+	const uint32_t wide = ::Loader::DemonsSoulsRenderSize::WideOutputWidth();
+	if (Hd::InterfaceScaled() || Hd::InterfaceAtOutput())
+		return vk::Extent2D {wide != 0 ? wide : Hd::UpscaledWidth(), Hd::UpscaledHeight()};
+	return Hd::Active() ? vk::Extent2D {Hd::HdWidth, Hd::HdHeight} : vk::Extent2D {wide != 0 ? wide : 3840u, 2160};
 }
 
 // FSR's HUD-less images (RecordHudless): the backbuffer with the HUD painted over by the scene around it, two in turn
@@ -1969,9 +1982,8 @@ bool TakeScene() {
 	// frame). The start-up logos run the TAA and the lighting over 36 draws without indices (the PlayStation Studios one is
 	// the game's own render): at -Fps120 they flipped 120 times a second, at twice their speed (issue #231). One indexed
 	// draw is enough: a view filled by a floor or a wall close up draws few (issue #241).
-	static std::atomic<uint64_t> drawn_before {0};
 	const uint64_t drawn = IndexedDrawPackets();
-	const bool     world = drawn != drawn_before.exchange(drawn, std::memory_order_relaxed);
+	const bool     world = drawn != g_drawn_at_flip.exchange(drawn, std::memory_order_relaxed);
 	const bool     scene = g_scene.exchange(false, std::memory_order_relaxed) && world;
 	g_last_scene.store(scene, std::memory_order_relaxed);
 	g_flips_taken.fetch_add(1, std::memory_order_relaxed);
@@ -1982,8 +1994,35 @@ uint64_t GuestFlips() {
 	return g_flips_taken.load(std::memory_order_relaxed);
 }
 
+void NoteMenu() {
+	g_menu.store(true, std::memory_order_relaxed);
+}
+
+void NoteCentred() {
+	g_centred.store(true, std::memory_order_relaxed);
+}
+
+bool TakeMenu() {
+	// (A closed menu fades out over a few more frames without the draws NoteMenu takes it by: 20 flips more in the
+	// middle, a third of a second, and its fade ends at 16:9 instead of widened across the screen.)
+	constexpr int HoldFlips = 20;
+	const bool    menu      = g_menu.exchange(false, std::memory_order_relaxed);
+	g_menu_hold.store(menu ? HoldFlips : std::max(0, g_menu_hold.load(std::memory_order_relaxed) - 1),
+	                  std::memory_order_relaxed);
+	return g_centred.exchange(false, std::memory_order_relaxed);
+}
+
+bool MenuNoted() {
+	return g_menu.load(std::memory_order_relaxed) || g_menu_hold.load(std::memory_order_relaxed) > 0;
+}
+
 bool SceneNoted() {
-	return g_scene.load(std::memory_order_relaxed) || g_last_scene.load(std::memory_order_relaxed);
+	// (The current frame as TakeScene will tell it: the TAA pass over a world drawn with indices since the last flip. The
+	// start-up logos' TAA over draws without indices had their pictures widened across the wide output, which the
+	// presenter, not taking them for the 3D view, cut to its 16:9 part: the logos at its right edge, issue #250.)
+	return (g_scene.load(std::memory_order_relaxed) &&
+	        IndexedDrawPackets() != g_drawn_at_flip.load(std::memory_order_relaxed)) ||
+	       g_last_scene.load(std::memory_order_relaxed);
 }
 
 void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,
@@ -2080,11 +2119,12 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 			auto& ui = cache.GetImage(id);
 			now      = 2;
 			if (!IsDepthFormat(ui.backing.format)) {
-				// (At most 1920x1080, the 4K canvas at half its size: its alpha is a mask, read a few pixels wide; a
-				// quarter of the video memory.)
-				bool failed = false;
+				// (At most 1080 high, the 4K canvas at half its size, a wider one at the same scale: its alpha is a mask,
+				// read a few pixels wide; a quarter of the video memory.)
+				const uint32_t high   = std::min(size.height, 1080u);
+				bool           failed = false;
 				Configure(graphics, inputs.ui, inputs.ui_view, ui.backing, nullptr,
-				          vk::Extent2D {std::min(size.width, 1920u), std::min(size.height, 1080u)}, &failed);
+				          vk::Extent2D {std::max(1u, size.width * high / std::max(1u, size.height)), high}, &failed);
 				if (!failed) {
 					BlitInto(vk_command, ui, inputs.ui);
 					inputs.ui_valid = true;
@@ -2669,14 +2709,24 @@ void DestroySwapchain(GraphicContext& graphics, vk::SwapchainKHR swapchain) {
 	(void)swapchain;
 #ifdef KYTY_FRAMEGEN_FSR
 	auto& s = g_fsr_state;
-	// (The frame generation context is made for the display size: again with the next swapchain.)
-	FsrDestroyFrameGeneration();
-	FsrHudDestroy(graphics);
+	// Frame generation off, then the swapchain: its destruction stops its present thread and waits for its presents.
+	// Then FSR's own queues (nothing else submits to them) are waited for, and only then go the frame generation context
+	// and the HUD-less images its interpolation reads. Freed before the swapchain, they could still be in use: on an RTX
+	// 5090 an F11 back to the window, frame generation on at 5120x2160 since a load, lost the device, and an F11 in the
+	// main menu froze the picture while the game ran on (issue #174).
+	FsrStopFrameGeneration();
 	if (s.swapchain_context != nullptr) {
 		(void)s.api.DestroyContext(&s.swapchain_context, nullptr); // (and its swapchain)
 		s.swapchain_context = nullptr;
 	}
 	s.swapchain = nullptr;
+	for (const vk::Queue queue: {graphics.fsr_compute_queue, graphics.fsr_present_queue, graphics.fsr_acquire_queue}) {
+		if (queue != nullptr) (void)queue.waitIdle();
+	}
+	// (The frame generation context is made for the display size: again with the next swapchain. Its swapchain gone,
+	// FsrDestroyFrameGeneration configures nothing.)
+	FsrDestroyFrameGeneration();
+	FsrHudDestroy(graphics);
 	s.functions = {};
 #endif
 }

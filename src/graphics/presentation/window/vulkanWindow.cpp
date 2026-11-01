@@ -802,8 +802,15 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	}
 #endif
 	(void)fsr_queues;
-	// (KYTY_READBACK_QUEUE=0: no transfer queue, as the switch's mode; performance-switches.h.)
-	if (const char* readback = std::getenv("KYTY_READBACK_QUEUE"); readback == nullptr || std::strcmp(readback, "0") != 0) {
+	// (KYTY_READBACK_QUEUE=0: no transfer queue, as the switch's mode; performance-switches.h.) Not on an Intel GPU unless
+	// it is set: an Arc B580 (driver 8801) stopped finishing that queue's copies after a while in 1-2 and 3-1, then the
+	// graphics queue too, the game frozen; with the copies on the graphics queue an hour played clean (issue #255).
+	const char* readback = std::getenv("KYTY_READBACK_QUEUE");
+	const bool  intel    = physical_device.getProperties().vendorID == 0x8086u;
+	if (readback == nullptr || *readback == '\0') {
+		if (intel) std::printf("Readback copies: on the graphics queue (an Intel GPU; KYTY_READBACK_QUEUE=1: the copy queue, issue #255)\n");
+	}
+	if (readback != nullptr && *readback != '\0' ? std::strcmp(readback, "0") != 0 : !intel) {
 		uint32_t family_count = 0;
 		physical_device.getQueueFamilyProperties(&family_count, nullptr);
 		std::vector<vk::QueueFamilyProperties> families(family_count);

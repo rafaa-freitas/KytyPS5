@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -111,6 +112,28 @@ inline void NoteFlip() {
 // The wide output's canvas width (0: none).
 inline uint32_t WideWidth() {
 	return ::Loader::DemonsSoulsRenderSize::WideOutputWidth();
+}
+
+// KYTY_PRESENT_ASPECT=fit with a wider aspect (KYTY_RENDER_ASPECT): the game's menus at 16:9 in the middle of the
+// picture (StretchScope), which the presenter shows between black bars (FrameGen::TakeMenu), not widened across it
+// like the rest of the interface: the wide output's 16:9 part there, or where the 3D is squeezed into the game's own
+// 16:9 output (its TAA) the middle part the presenter widens back to 16:9, the menu squeezed into it as much.
+inline bool MenuBars() {
+	static const bool fit = [] {
+		const char* value = std::getenv("KYTY_PRESENT_ASPECT");
+		return value != nullptr && std::string_view(value) == "fit";
+	}();
+	return fit && ::Loader::DemonsSoulsRenderSize::WideAspect() > 0.0;
+}
+
+// The current frame's interface goes to the middle: MenuBars, and this frame or the last drew a menu (NoteMenuDraw).
+inline bool MenuCentred() {
+	return MenuBars() && FrameGen::MenuNoted();
+}
+
+// The frame shows the 3D view with its HUD (Classify): not a menu in the middle.
+inline bool HudFrame() {
+	return FrameGen::SceneNoted() && !MenuCentred();
 }
 
 // The width of the interface canvas the draw goes into: the game's 3840, or the wide output's (the performance mode's;
@@ -241,12 +264,14 @@ inline bool  OutputTarget(const HW::Context& ctx);
 
 // KYTY_FRAMEGEN_BACKEND=fsr: an interface draw names the canvas (its render target) whose alpha marks the HUD for FSR
 // (FrameGen::NoteUiCanvas). With the interface scaled to KYTY_OUTPUT_HEIGHT's output the canvas is the output's size
-// (OutputTarget): at 1440 FSR found none and generated the HUD too, which flickered (issue #170).
+// (OutputTarget): at 1440 FSR found none and generated the HUD too, which flickered (issue #170). With the wide output
+// the HUD's canvas is as wide as it (WideWidth; issue #250, the same ghosting at 32:9).
 inline void NoteCanvas(const HW::Context& ctx, const HW::VertexShaderInfo& vs) {
-	const auto& target = ctx.GetRenderTarget(0);
-	const bool  canvas = OutputScale() > 0.0f ? OutputTarget(ctx)
-	                                          : target.attrib2.width + 1u == CanvasWidth() &&
-	                                               target.attrib2.height + 1u == CanvasHeight();
+	const auto&    target = ctx.GetRenderTarget(0);
+	const uint32_t width  = WideWidth() != 0 ? WideWidth() : CanvasWidth();
+	const bool     canvas = OutputScale() > 0.0f ? OutputTarget(ctx)
+	                                             : target.attrib2.width + 1u == width &&
+	                                                  target.attrib2.height + 1u == CanvasHeight();
 	if (target.base.addr == 0 || !canvas) return;
 	const uint64_t hash = HashAt(vs.es_regs.data_addr);
 	if (hash == PixelShader || std::find(ClipShaders.begin(), ClipShaders.end(), hash) != ClipShaders.end())
@@ -280,9 +305,10 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 	const uint64_t hash  = HashAt(vs.es_regs.data_addr);
 	const bool     clip  = std::find(ClipShaders.begin(), ClipShaders.end(), hash) != ClipShaders.end();
 	if (!clip && hash != PixelShader) return 0;
-	// (An interface shader's target: the canvas the wide output's other draws into it are widened in, StretchScope.)
-	if (width != CanvasWidth()) state.canvas = target.base.addr;
-	if (!FrameGen::SceneNoted()) return 0;
+	// (An interface shader's target: the canvas the wide output's other draws into it are widened in, StretchScope; with
+	// the 3D squeezed into the game's own 16:9 output, its canvas, where a menu shown is squeezed into the middle.)
+	if (width != CanvasWidth() || WideWidth() == 0) state.canvas = target.base.addr;
+	if (!HudFrame()) return 0;
 	const auto& viewport = ctx.GetScreenViewport().viewports[0];
 	const auto& user   = vs.gs_user_sgpr;
 	uint64_t    base   = 0;
@@ -596,30 +622,45 @@ private:
 };
 
 // A draw into the wide output's interface canvas in a frame showing the 3D: widened (StretchScope) unless it is the HUD's.
+// Where the 3D is squeezed into the game's own 16:9 output, a draw into its canvas while a menu is shown in the middle.
 inline bool Stretched(const HW::Context& ctx) {
-	if (g_state.canvas == 0 || !FrameGen::SceneNoted() || CanvasWidthOf(ctx) <= CanvasWidth()) return false;
+	if (g_state.canvas == 0 || !FrameGen::SceneNoted()) return false;
+	if (CanvasWidthOf(ctx) <= CanvasWidth() && (WideWidth() != 0 || !MenuCentred())) return false;
 	return ctx.GetRenderTarget(0).base.addr == g_state.canvas;
+}
+
+// StretchScope's x' = k x + shift of the 3840 wide layout: widened from its left edge across the canvas, or, a menu shown
+// with MenuBars (MenuCentred), at its own size in the middle (issue #250: the menus at 16:9 between black bars). With
+// the 3D squeezed into the game's own 16:9 output, which the presenter widens: the menu squeezed about the middle as
+// much (16:9 over the aspect), the part the presenter shows widened back to 16:9.
+inline std::pair<float, float> StretchTransform() {
+	const float wide = static_cast<float>(WideWidth()), layout = static_cast<float>(CanvasWidth());
+	if (!MenuCentred()) return {wide / layout, 0.0f};
+	if (wide != 0.0f) return {1.0f, (wide - layout) / 2.0f};
+	const auto squeeze = static_cast<float>((16.0 / 9.0) / ::Loader::DemonsSoulsRenderSize::WideAspect());
+	return {squeeze, layout * (1.0f - squeeze) / 2.0f};
 }
 
 // A rectangle of the 3840 wide layout where StretchScope's widening puts it.
 inline Rect Widened(const Rect& rect) {
-	const float k = static_cast<float>(WideWidth()) / CanvasWidth();
-	return {static_cast<int>(std::floor(rect.left * k)), rect.top, static_cast<int>(std::ceil(rect.right * k)), rect.bottom};
+	const auto [k, shift] = StretchTransform();
+	return {static_cast<int>(std::floor(rect.left * k + shift)), rect.top, static_cast<int>(std::ceil(rect.right * k + shift)),
+	        rect.bottom};
 }
 
 // For the length of one draw into the wide output's interface canvas that is not the HUD's (menus, fades, markers over
 // the world): widened from the 3840 wide layout at the left edge to the canvas - the viewport, a scissor narrower than
 // the canvas (the layout's) and a masked icon's mask with it -, the picture the 16:9 output widened showed; restored
-// after it.
+// after it. A menu shown with MenuBars: moved to the middle at its own size instead (StretchTransform).
 class StretchScope {
 public:
 	StretchScope(HW::Context& ctx, const HW::PixelShaderInfo& ps): m_ctx(&ctx), m_screen(ctx.GetScreenViewport()) {
-		const auto  width    = static_cast<int>(WideWidth());
-		const float k        = static_cast<float>(width) / CanvasWidth();
-		const auto& viewport = m_screen.viewports[0];
-		const auto  widen    = [&](int x) { return std::clamp(static_cast<int>(std::lround(x * k)), 0, width); };
+		const auto width      = static_cast<int>(std::max(WideWidth(), CanvasWidth()));
+		const auto [k, shift] = StretchTransform();
+		const auto& viewport  = m_screen.viewports[0];
+		const auto  widen     = [&](int x) { return std::clamp(static_cast<int>(std::lround(x * k + shift)), 0, width); };
 		ctx.SetViewportXScale(0, viewport.xscale * k);
-		ctx.SetViewportXOffset(0, viewport.xoffset * k);
+		ctx.SetViewportXOffset(0, viewport.xoffset * k + shift);
 		if (m_screen.generic_scissor_left > 0 || m_screen.generic_scissor_right < width)
 			ctx.SetGenericScissor(widen(m_screen.generic_scissor_left), m_screen.generic_scissor_top,
 			                      widen(m_screen.generic_scissor_right), m_screen.generic_scissor_bottom,
@@ -628,7 +669,8 @@ public:
 			ctx.SetViewportScissor(0, widen(viewport.viewport_scissor_left), viewport.viewport_scissor_top,
 			                       widen(viewport.viewport_scissor_right), viewport.viewport_scissor_bottom,
 			                       viewport.viewport_scissor_window_offset_enable);
-		PatchMask(ps, k, 0.0f); // (only a masked icon's)
+		PatchMask(ps, k, shift); // (only a masked icon's)
+		if (shift != 0.0f) FrameGen::NoteCentred();
 		Changed();
 	}
 	~StretchScope() {
@@ -684,6 +726,15 @@ constexpr std::array<uint64_t, 2> HdLayoutShaders {0x05ca0d08ae41fd2eULL, 0xa64d
 // scissor in layout pixels).
 constexpr std::array<std::pair<uint64_t, uint64_t>, 2> HdLayoutPairs {
     {{0x3ec043bd86013cafULL, 0x91cd581e82574995ULL}, {0x5d9a2e8e34030f35ULL, 0xae51f2cf2ca8c121ULL}}};
+
+// With MenuBars, an interface draw of those two (the glow behind a menu's selected slot, of its title band): the frame
+// shows one of the game's menus (FrameGen::NoteMenu). 1-1 at 32:9, the equipment menu and its submenus: in each of
+// their frames, early on (before the canvas's other draws); never in play.
+[[gnu::noinline]] inline void NoteMenuDraw(const HW::VertexShaderInfo& vs, const HW::PixelShaderInfo& ps) {
+	if (!MenuBars()) return;
+	const auto pair = std::make_pair(HashAt(vs.es_regs.data_addr), PixelShaderHash(ps));
+	if (std::find(HdLayoutPairs.begin(), HdLayoutPairs.end(), pair) != HdLayoutPairs.end()) FrameGen::NoteMenu();
+}
 
 inline bool Scaled(const HW::Context& ctx, const HW::VertexShaderInfo& vs, const HW::PixelShaderInfo& ps) {
 	if (OutputScale() <= 0.0f || !OutputTarget(ctx)) return false;

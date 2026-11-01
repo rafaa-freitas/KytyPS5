@@ -127,8 +127,10 @@ static int ControllerAxisValueFromSdl(int axis_id, int axis_value) {
 
 // The sticks of a pad other than a PlayStation one, whose sticks rest a few percent off centre (more as they wear): a
 // round dead zone of KYTY_PAD_DEADZONE percent of the range (12 by default, 0 none), the rest stretched to the full
-// range. On an Xbox pad the character kept walking slowly after a run let go (issue #236). PlayStation pads are passed
-// as they are, to the game's own dead zone as on a PS5; so is the Steam Deck build's pad (Steam Input has one).
+// range, which the stick reaches at KYTY_PAD_DEADZONE_OUTER percent of it (90 by default). On an Xbox pad the character
+// kept walking slowly after a run let go (issue #236); with the dead zone stretched to the edge alone, a stick pushed all
+// the way (a little under its full range at some angles) lost the run more easily. PlayStation pads are passed as they
+// are, to the game's own dead zone as on a PS5; so is the Steam Deck build's pad (Steam Input has one).
 static int PadDeadZonePercent() {
 	static const int percent = [] {
 #if defined(KYTY_STEAM_DECK)
@@ -142,7 +144,15 @@ static int PadDeadZonePercent() {
 	return percent;
 }
 
-// The stick of `axis_id` with the dead zone, both its axes set (PadDeadZonePercent); false: as it is.
+static int PadOuterPercent() {
+	static const int percent = [] {
+		const char* value = std::getenv("KYTY_PAD_DEADZONE_OUTER");
+		return value != nullptr && *value != '\0' ? std::clamp(std::atoi(value), 60, 100) : 90;
+	}();
+	return percent;
+}
+
+// The stick of `axis_id` with the dead zone, both its axes set (PadDeadZonePercent, PadOuterPercent); false: as it is.
 static bool SetStickWithDeadZone(int id, int axis_id) {
 	const int percent = PadDeadZonePercent();
 	if (percent == 0 || ControllerAxisIsTrigger(axis_id)) return false;
@@ -156,7 +166,8 @@ static bool SetStickWithDeadZone(int id, int axis_id) {
 	const double x = SDL_GameControllerGetAxis(pad, axis_x), y = SDL_GameControllerGetAxis(pad, axis_y);
 	const double radius = std::sqrt(x * x + y * y) / SDL_JOYSTICK_AXIS_MAX;
 	const double dead   = percent / 100.0;
-	const double scale  = radius <= dead ? 0.0 : std::min(1.0, (radius - dead) / (1.0 - dead)) / radius;
+	const double outer  = std::max(dead + 0.05, PadOuterPercent() / 100.0);
+	const double scale  = radius <= dead ? 0.0 : std::min(1.0, (radius - dead) / (outer - dead)) / radius;
 	const auto   value  = [&](double v) {
         return static_cast<int>(std::clamp(std::lround(v * scale), long {SDL_JOYSTICK_AXIS_MIN}, long {SDL_JOYSTICK_AXIS_MAX}));
 	};
@@ -214,6 +225,8 @@ struct EventController {
 	bool   pressed;
 	bool   released;
 	double timestamp_seconds;
+	// A press: how long its event waited in SDL's queue for this thread, ms (Controller::SetButton's input timing).
+	uint32_t queued_ms;
 };
 
 enum class DisplayOrientation {
@@ -490,7 +503,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 			if (type != SDL_CONTROLLER_TYPE_PS4 && type != SDL_CONTROLLER_TYPE_PS5) button = Controller::PAD_BUTTON_TOUCH_PAD;
 		}
 		if (button != 0) {
-			Controller::SetButton(f.id, button, f.down);
+			Controller::SetButton(f.id, button, f.down, f.queued_ms);
 		}
 	}
 
@@ -829,6 +842,7 @@ void WindowContext::ProcessEvent(double time_s) {
 			c.pressed           = (event->cbutton.state == SDL_PRESSED);
 			c.released          = (event->cbutton.state == SDL_RELEASED);
 			c.timestamp_seconds = time_s;
+			c.queued_ms         = c.down ? SDL_GetTicks() - event->cbutton.timestamp : 0;
 
 			GameEventController(c);
 
@@ -962,6 +976,11 @@ static void WindowCreate(WindowContext& context) {
 
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+	// Nintendo-layout pads (Switch Pro, Joy-Cons, 8BitDo in Switch mode, GameCube) by position: the bottom button Cross and
+	// the right one Circle, where the game's PlayStation glyphs put them. SDL 2 reported them by label (A, on the right,
+	// was Cross; issue #262). SDL_GAMECONTROLLER_USE_BUTTON_LABELS=1 in the environment keeps the labels (the environment
+	// wins over a hint).
+	SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
 	// Pixel-exact windows and swapchains on scaled displays: without per-monitor awareness a

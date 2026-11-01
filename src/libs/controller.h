@@ -81,7 +81,8 @@ inline int controller_get_axis(int min, int max, int value) {
 
 void Connect(int id);
 void Disconnect(int id);
-void SetButton(int id, uint32_t button, bool down);
+// `queued_ms`: a press's time in SDL's event queue (the input timing in the log, issue #236; 0: not known).
+void SetButton(int id, uint32_t button, bool down, uint32_t queued_ms = 0);
 void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);

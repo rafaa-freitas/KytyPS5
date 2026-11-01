@@ -530,7 +530,8 @@ constexpr auto     RetireTime   = std::chrono::seconds(20);
 constexpr uint64_t MinIdleTicks = 120;
 
 // KYTY_TEST_RECLAIM=<n>: the first n images that must exist, of 1 MiB and more, asked for from the 600th flip on, are
-// taken as not made once (ReclaimImageMemory, then made again).
+// taken as not made once (ReclaimImageMemory, then made again); KYTY_TEST_RECLAIM_ROUNDS=2: twice (the second round's
+// downloads too).
 [[gnu::noinline]] static bool TestReclaim(const ImageInfo& info, uint64_t tick) {
 	static std::atomic<int64_t> left {[] {
 		const char* value = std::getenv("KYTY_TEST_RECLAIM");
@@ -540,23 +541,41 @@ constexpr uint64_t MinIdleTicks = 120;
 	       left.fetch_sub(1, std::memory_order_relaxed) > 0;
 }
 
+static uint32_t TestReclaimRounds() {
+	static const uint32_t rounds = [] {
+		const char* value = std::getenv("KYTY_TEST_RECLAIM_ROUNDS");
+		return value != nullptr ? std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1, 2) : 1u;
+	}();
+	return rounds;
+}
+
 ImageId TextureCache::InsertImage(const ImageInfo& info, bool may_fail) {
 	auto id = m_slot_images.insert(m_graphics, m_scheduler, info, may_fail);
 	// An image that must exist (a render target, a depth image, a copy's) the GPU could not make: room is made at once
-	// (the second time all there is) and it is made again; failing still ends the emulator, as it did at once before.
+	// (the second time all there is, the images the GPU wrote too) and it is made again; then again for a while, as a
+	// buffer is (GraphicContext::RetryAllocation); failing still ends the emulator, as it did at once before.
 	// Issue #53: a 16 GB RX 7800 XT whose video memory another program had taken switched to the cinematic mode (AMD
-	// gives these images no system memory).
-	if (!may_fail && (m_slot_images[id].CreateFailed() || TestReclaim(info, m_gc_tick))) {
+	// gives these images no system memory). Issue #252: an 8 GB RX 6650 XT with FSR 3 frame generation at 3840x1200,
+	// 1.3 GB over its budget, freed 143 MiB of textures for a 135 MiB target and still had no room: the textures freed
+	// sat between others in VMA's 64 MiB blocks (2 of 121 memory objects went), and the target needs its own.
+	const bool test = !may_fail && TestReclaim(info, m_gc_tick);
+	if (!may_fail && (m_slot_images[id].CreateFailed() || test)) {
+		if (!test) m_failed_tick = m_gc_tick + 1; // (the collector takes more for a while: RunGarbageCollector)
 		for (uint32_t round = 0;; ++round) {
 			RetireImage(id); // (never registered)
-			const size_t freed = ReclaimImageMemory(info.data.size, round != 0);
-			id                 = m_slot_images.insert(m_graphics, m_scheduler, info, false);
-			if (!m_slot_images[id].CreateFailed()) break;
-			if (round != 0 || freed == 0) {
-				EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u: no memory for it\n",
-				     info.extent.width, info.extent.height, info.extent.depth, static_cast<int>(info.pixel_format),
-				     info.resources.layers, info.resources.levels);
-			}
+			(void)ReclaimImageMemory(info.data.size, round != 0);
+			id = m_slot_images.insert(m_graphics, m_scheduler, info, false);
+			if (!m_slot_images[id].CreateFailed() && !(test && round + 1 < TestReclaimRounds())) break;
+			if (round == 0) continue;
+			const bool made = m_graphics.RetryAllocation("an image", info.data.size, [&] {
+				RetireImage(id); // (never registered)
+				id = m_slot_images.insert(m_graphics, m_scheduler, info, false);
+				return !m_slot_images[id].CreateFailed();
+			});
+			if (made) break;
+			EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u: no memory for it\n",
+			     info.extent.width, info.extent.height, info.extent.depth, static_cast<int>(info.pixel_format),
+			     info.resources.layers, info.resources.levels);
 		}
 	}
 	if (m_slot_images[id].CreateFailed()) {
@@ -574,24 +593,44 @@ ImageId TextureCache::InsertImage(const ImageInfo& info, bool may_fail) {
 
 // The images no draw or dispatch used for 16 flips whose bytes guest memory holds (none the GPU wrote: one used again is
 // made again from them) go at once, least recently used first, until twice the room asked for (at least 256 MiB) is
-// freed (`all`: every one); the GPU finishes the work in flight first (it may read them still). (The collector frees
-// images unused for 30 flips at the earliest, and a mode switch needs the room in the flip it makes its targets. A
-// table set touches its images at least every 8 flips: TableImageSet::TouchTicks.)
+// freed (`all`: every one, and those the GPU wrote, their bytes downloaded to guest memory first, as the collector takes
+// them while memory is short: RunGarbageCollector); the GPU finishes the work in flight first (it may read them still).
+// (The collector frees images unused for 30 flips at the earliest, and a mode switch needs the room in the flip it makes
+// its targets. A table set touches its images at least every 8 flips: TableImageSet::TouchTicks.)
 size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
-	constexpr uint64_t UnusedTicks = 16;
-	const auto           start = std::chrono::steady_clock::now();
-	const uint64_t       goal  = all ? UINT64_MAX : std::max(bytes * 2, uint64_t {256} << 20u);
-	uint64_t             freed = 0;
+	constexpr uint64_t UnusedTicks  = 16;
+	const auto         start        = std::chrono::steady_clock::now();
+	const uint64_t     goal         = all ? UINT64_MAX : std::max(bytes * 2, uint64_t {256} << 20u);
+	const uint64_t     download_max = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size() / 2;
+	uint64_t           freed = 0, written_bytes = 0;
+	size_t             written = 0;
 	std::vector<ImageId> victims;
 	if (m_gc_tick >= UnusedTicks) {
 		m_lru_cache.ForEachItemBelow(m_gc_tick - UnusedTicks, [&](ImageId id) {
 			const auto* owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id || owner->IsGpuModified()) return false;
+			if (owner == nullptr || !owner->registered || owner->depth_id) return false;
+			// (A tiled one too large for the download buffer stays, as in the collector.)
+			if (owner->IsGpuModified() && (!all || (owner->info.IsTiled() && SafeToDownload(*owner) &&
+			                                        owner->info.data.size > download_max)))
+				return false;
 			victims.push_back(id);
 			freed += owner->AccountedSize();
 			return freed >= goal;
 		});
 	}
+	// (One the GPU wrote whose download did not start stays. Not safe to download: a GPU buffer write is newer.)
+	std::erase_if(victims, [&](ImageId id) {
+		auto& owner = m_slot_images[id];
+		if (!owner.IsGpuModified()) return false;
+		if (SafeToDownload(owner) && !TryDownloadImage(id)) {
+			freed -= owner.AccountedSize();
+			return true;
+		}
+		owner.ClearGpuModified();
+		written++;
+		written_bytes += owner.AccountedSize();
+		return false;
+	});
 	std::erase_if(victims, [&](ImageId id) { return !DetachImage(id); });
 	if (!victims.empty()) {
 		m_scheduler.Wait(m_scheduler.CurrentTick());
@@ -601,10 +640,11 @@ size_t TextureCache::ReclaimImageMemory(uint64_t bytes, bool all) {
 	}
 	static std::atomic<uint32_t> reports {0};
 	if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
-		std::printf("Texture cache: no memory for a %llu MiB image, %zu images unused for %llu flips freed (%llu MiB) "
-		            "in %.1f ms\n",
+		std::printf("Texture cache: no memory for a %llu MiB image, %zu images unused for %llu flips freed (%llu MiB; %zu "
+		            "of them the GPU wrote, %llu MiB) in %.1f ms\n",
 		            static_cast<unsigned long long>(bytes >> 20u), victims.size(),
-		            static_cast<unsigned long long>(UnusedTicks), static_cast<unsigned long long>(freed >> 20u),
+		            static_cast<unsigned long long>(UnusedTicks), static_cast<unsigned long long>(freed >> 20u), written,
+		            static_cast<unsigned long long>(written_bytes >> 20u),
 		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
 		std::fflush(stdout);
 	}

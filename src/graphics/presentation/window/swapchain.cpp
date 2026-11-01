@@ -68,6 +68,7 @@ struct Presenter::Frame {
 	bool                   hdr          = false; // BT.2100 PQ pixels
 	bool                   blank        = false; // a cleared frame (no guest picture)
 	bool                   scene        = false; // the game's 3D view (FrameGen::TakeScene)
+	bool                   menu         = false; // its interface (a menu) at 16:9 in the middle (FrameGen::TakeMenu)
 	uint64_t               anti_lag_frame = 0;   // the frame AMD Anti-Lag numbered it (AntiLag::Flip), 0: none
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
@@ -339,12 +340,13 @@ public:
 	[[nodiscard]] Status AcquireNextImage();
 	[[nodiscard]] bool   PrepareSystemOverlay(SystemOverlayHud* hud = nullptr);
 	// `source_view`: `source` sampled (the dithered copy), or null.
-	// `scene`: the frame shows the game's 3D view (Presenter::IsSceneFrame).
+	// `scene`: the frame shows the game's 3D view (Presenter::IsSceneFrame); `menu`: a menu at 16:9 in the middle of the
+	// wide output (FrameGen::TakeMenu), shown alone between black bars with KYTY_PRESENT_ASPECT=fit.
 	// `fsr_inputs`: the frame's inputs for FSR's HUD-less image (FrameGen::RecordHudless), or null.
 	// `target` (Linux frame generation): the frame finished into that image (the swapchain's size and format; its
 	// `target_view` for the system overlay) instead of the acquired swapchain image, left in the general layout.
 	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source, vk::ImageView source_view,
-	                                           bool draw_system_overlay, bool scene,
+	                                           bool draw_system_overlay, bool scene, bool menu,
 	                                           const FrameGen::FrameInputs* fsr_inputs = nullptr,
 	                                           VulkanImage* target = nullptr, vk::ImageView target_view = nullptr);
 	// The acquired swapchain image made a copy of `source` (the swapchain's size and format, general layout) and left for
@@ -375,7 +377,7 @@ private:
 	// `source` (a 10-bit frame) drawn into the 8-bit `dst_image` at m_present_region with an ordered dither, where the blit
 	// rounded each pixel (issue #234: the loading screens' fog banded); false (nothing recorded) where it does not apply.
 	bool RecordDitheredCopy(vk::CommandBuffer command, VulkanImage& source, vk::ImageView source_view,
-	                        vk::Image dst_image, vk::ImageView dst_view, uint32_t src_w);
+	                        vk::Image dst_image, vk::ImageView dst_view, uint32_t src_x, uint32_t src_w);
 
 	WindowContext&              m_window;
 	vk::SwapchainKHR            m_handle = nullptr;
@@ -754,6 +756,7 @@ struct Presenter::Impl {
 		frame.hdr      = false;
 		frame.blank    = true;
 		frame.scene    = false;
+		frame.menu     = false;
 		frame.Configure(window.graphic_ctx, {width, height}, frames.GetFormat());
 		vk::ClearColorValue clear {};
 		clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -880,7 +883,7 @@ struct Presenter::Impl {
 				    (static_cast<float>(hud->drawn.offset.y - region.offset.y) + static_cast<float>(hud->drawn.extent.height) + margin) / h);
 			}
 			// (With the frame's inputs FSR 3 built in gets its HUD-less image too: FrameGen::RecordHudless.)
-			swapchain.RecordPresentCommands(command, frame.image, frame.view, draw_system_overlay, frame.scene,
+			swapchain.RecordPresentCommands(command, frame.image, frame.view, draw_system_overlay, frame.scene, frame.menu,
 			                                frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr, &composed,
 			                                composed_view);
 			if (FrameGen::HudlessOn() && !frame.reusing_last) {
@@ -1332,7 +1335,7 @@ static bool PresentDither() {
 }
 
 bool Swapchain::RecordDitheredCopy(vk::CommandBuffer command, VulkanImage& source, vk::ImageView source_view,
-                                   vk::Image dst_image, vk::ImageView dst_view, uint32_t src_w) {
+                                   vk::Image dst_image, vk::ImageView dst_view, uint32_t src_x, uint32_t src_w) {
 	// Where the blit rounds away bits the frame has: a 10-bit (or half-float) frame into an 8-bit image (not HDR's 10-bit).
 	const bool deep = source.format == vk::Format::eA2B10G10R10UnormPack32 ||
 	                  source.format == vk::Format::eA2R10G10B10UnormPack32 ||
@@ -1498,8 +1501,10 @@ bool Swapchain::RecordDitheredCopy(vk::CommandBuffer command, VulkanImage& sourc
 	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
 	write.pImageInfo      = &sampled;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_dither_layout, 0, 1, &write);
-	// present_dither.frag: the region's top left, and the frame's texture coordinates per pixel (its `src_w` columns).
-	const std::array<float, 4> constants {viewport.x, viewport.y,
+	// present_dither.frag: the region's top left, and the frame's texture coordinates per pixel (its `src_w` columns);
+	// the frame's columns from `src_x` on: the region's left edge as if src_x of them came before it.
+	const std::array<float, 4> constants {viewport.x - static_cast<float>(src_x) * viewport.width / static_cast<float>(src_w),
+	                                      viewport.y,
 	                                      static_cast<float>(src_w) / static_cast<float>(source.extent.width) / viewport.width,
 	                                      1.0f / viewport.height};
 	command.pushConstants(m_dither_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(constants), constants.data());
@@ -1520,7 +1525,7 @@ bool Swapchain::RecordDitheredCopy(vk::CommandBuffer command, VulkanImage& sourc
 }
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source, vk::ImageView source_view,
-                                      bool draw_system_overlay, bool scene,
+                                      bool draw_system_overlay, bool scene, bool menu,
                                       const FrameGen::FrameInputs* fsr_inputs, VulkanImage* target,
                                       vk::ImageView target_view) {
 	if (source.state.layout != vk::ImageLayout::eTransferSrcOptimal) {
@@ -1563,15 +1568,26 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	// (movies, menus, loading screens) stretched from their 16:9 (the user, 10-19: the opening movie filling the screen),
 	// or with KYTY_PRESENT_ASPECT=fit kept at their 16:9 (black bars at the sides; issue #97).
 	// With the wide output (DemonsSoulsRenderSize::WideOutputWidth) the game's frames are as wide as the 3D; one without
-	// it (movies, menus, loading screens) holds its 16:9 picture at the left: that part is shown, stretched or fitted.
+	// it (movies, menus, loading screens) holds its 16:9 picture at the left: that part is shown, stretched or fitted. A
+	// menu over the 3D view with KYTY_PRESENT_ASPECT=fit (`menu`: hud-anchor put it at 16:9 in the middle) shows that
+	// middle part alone at 16:9, between black bars (issue #250): the wide output's 16:9 part, or with the 3D squeezed
+	// into the game's own 16:9 output the middle 16:9-over-the-aspect of it, widened back (the menu squeezed as much).
 	int          dst_x = 0, dst_y = 0;
 	int          dst_w = static_cast<int>(m_extent.width), dst_h = static_cast<int>(m_extent.height);
-	uint32_t     src_w = source.extent.width;
-	if (!scene && Loader::DemonsSoulsRenderSize::WideOutputWidth() != 0 && source.extent.height != 0)
+	uint32_t     src_x = 0, src_w = source.extent.width;
+	const double wide        = Loader::DemonsSoulsRenderSize::WideAspect();
+	const bool   wide_output = Loader::DemonsSoulsRenderSize::WideOutputWidth() != 0 && source.extent.height != 0;
+	const bool   middle      = menu && aspect_fit && wide > 0.0 && source.extent.height != 0;
+	if ((!scene || middle) && wide_output) {
 		src_w = std::min(src_w, (source.extent.height * 16u + 8u) / 9u);
-	const double frame_aspect = source.extent.height != 0 ? static_cast<double>(src_w) / source.extent.height : 0.0;
-	const double wide         = Loader::DemonsSoulsRenderSize::WideAspect();
-	double       aspect       = wide > 0.0 && (scene || !aspect_fit) ? wide : aspect_fit ? frame_aspect : 0.0;
+	} else if (middle) {
+		src_w = std::clamp(static_cast<uint32_t>(std::lround(src_w * (16.0 / 9.0) / wide)), 1u, src_w);
+	}
+	if (middle) src_x = (source.extent.width - src_w) / 2;
+	const double frame_aspect = middle                     ? 16.0 / 9.0
+	                           : source.extent.height != 0 ? static_cast<double>(src_w) / source.extent.height
+	                                                       : 0.0;
+	double       aspect       = wide > 0.0 && ((scene && !middle) || !aspect_fit) ? wide : aspect_fit ? frame_aspect : 0.0;
 	if (const double window = static_cast<double>(m_extent.width) / std::max(1u, m_extent.height);
 	    wide > 0.0 && std::fabs(aspect / window - 1.0) < 0.02) {
 		aspect = 0.0;
@@ -1602,7 +1618,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	region.srcSubresource.mipLevel       = 0;
 	region.srcSubresource.baseArrayLayer = 0;
 	region.srcSubresource.layerCount     = 1;
-	region.srcOffsets[1].x               = static_cast<int>(src_w);
+	region.srcOffsets[0].x               = static_cast<int>(src_x);
+	region.srcOffsets[1].x               = static_cast<int>(src_x + src_w);
 	region.srcOffsets[1].y               = static_cast<int>(source.extent.height);
 	region.srcOffsets[1].z               = 1;
 	region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
@@ -1614,7 +1631,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	region.dstOffsets[1].x               = dst_x + dst_w;
 	region.dstOffsets[1].y               = dst_y + dst_h;
 	region.dstOffsets[1].z               = 1;
-	if (!RecordDitheredCopy(vk_command, source, source_view, dst_image, dst_view, src_w)) {
+	if (!RecordDitheredCopy(vk_command, source, source_view, dst_image, dst_view, src_x, src_w)) {
 		vk_command.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
 		                     vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eLinear);
 	}
@@ -1794,8 +1811,10 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
 	frame->scene    = FrameGen::TakeScene();
+	frame->menu     = FrameGen::TakeMenu();
 	frame->fg.valid = false;
-	if (FrameGen::Enabled()) {
+	// (A menu shown alone at 16:9 gets no frames generated: the inputs are the whole wide output's.)
+	if (FrameGen::Enabled() && !frame->menu) {
 		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(),
 		                        buffer, frame->fg);
 		if (FrameGen::HudlessOn()) {
@@ -1821,12 +1840,27 @@ Presenter::Frame* Presenter::PrepareLastFrame() {
 
 // KYTY_PRESENT_DIRECT=1 (a test for issue #37, a variable refresh rate that stopped engaging in v20261016b): each frame
 // is presented on the vblank thread as it is handed over, as before the presenter had a thread of its own (eadf554f).
+// Not with FSR 3's frame generation: the vblank thread then waits in its swapchain's presents (two a game frame), and the
+// game flipped at half the display's rate (at 60 Hz: 30.0 fps, done to flip 32 ms, against 60.2 and 16 ms on the
+// presenter's thread; issue #236: an RTX 4090 at 120 Hz held at 30 in every session). DLSS-G keeps it: there the game ran
+// at the full rate with it (120 shown of 60 at 120 Hz), and VRR displays ran smoother (v20261031 had it off with any
+// frame generation; issue #236).
 static bool PresentDirect() {
-	static const bool on = [] {
+	static const bool requested = [] {
 		const char* value = std::getenv("KYTY_PRESENT_DIRECT");
 		return value != nullptr && value[0] == '1';
 	}();
-	return on;
+	if (!requested) return false;
+	if (FrameGen::UsesFsr() || FsrNative::InterpolationRequested()) {
+		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+		if (!reported.test_and_set()) {
+			std::printf("Presentation: KYTY_PRESENT_DIRECT off with FSR 3 frame generation (it held the game at half the "
+			            "display's rate; issue #236)\n");
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	return true;
 }
 
 void Presenter::Submit(Frame& frame, bool reuse) {
@@ -2030,7 +2064,8 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				    (static_cast<float>(hud->drawn.offset.x - region.offset.x) + static_cast<float>(hud->drawn.extent.width) + margin) / w,
 				    (static_cast<float>(hud->drawn.offset.y - region.offset.y) + static_cast<float>(hud->drawn.extent.height) + margin) / h);
 			}
-			swapchain.RecordPresentCommands(command, frame.image, frame.view, draw_system_overlay, frame.scene, fsr_inputs);
+			swapchain.RecordPresentCommands(command, frame.image, frame.view, draw_system_overlay, frame.scene, frame.menu,
+			                                fsr_inputs);
 			if (FrameGen::OwnsSwapchain()) {
 				FrameGen::RecordPrepare(m_impl->window.graphic_ctx, command.Handle(), fsr_inputs, swapchain.PresentRegion());
 			} else if (FrameGen::HudlessOn() && !frame.reusing_last) {

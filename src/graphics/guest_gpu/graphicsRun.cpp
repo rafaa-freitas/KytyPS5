@@ -1473,7 +1473,9 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 		return 0;
 	CheckBuffer();
 	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h); a draw over several of its
-	// areas goes the normal way, drawn once for each.
+	// areas goes the normal way, drawn once for each. A menu's own draw notes the menu first (its interface then goes
+	// to the middle, KYTY_PRESENT_ASPECT=fit).
+	HudAnchor::NoteMenuDraw(m_sh_ctx.GetVs(), m_sh_ctx.GetPs());
 	const auto hud =
 	    HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), packet[1], primitive));
 	if (hud.Several()) return 0u;
@@ -1812,7 +1814,9 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
 	}
-	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h).
+	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h); a menu's own draw notes the
+	// menu first.
+	HudAnchor::NoteMenuDraw(m_sh_ctx.GetVs(), m_sh_ctx.GetPs());
 	const auto hud = HudAnchor::Split(
 	    HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), args.vertex_count, m_ucfg.GetPrimType()));
 	if (hud.areas == 0 || hud.Single()) {

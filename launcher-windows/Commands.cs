@@ -74,11 +74,14 @@ sealed class Commands {
 		arguments.AddRange(new[] { "-Follow", "-Width", size[0], "-Height", size.Length > 1 ? size[1] : "1080", "-Language", Number(S.Int("language")) });
 		var ratio = S.Str("ratio");
 		var wide = ratio == "21:9" || ratio == "32:9";
-		// (-AspectFit with 21:9 or 32:9 would keep movies and menus at 16:9: the launcher's wider ratios fill the screen.)
+		// (-AspectFit: the 16:9 picture between black bars on a screen of another shape; with 21:9 or 32:9 the frames without
+		// the 3D view, the movies, the title and the loading screens, which fill the screen stretched otherwise: "wide_bars",
+		// in a window too.)
 		if (S.Bool("fullscreen")) {
 			arguments.Add("-Fullscreen");
 			if (S.Bool("aspect") && !wide) arguments.Add("-AspectFit");
 		}
+		if (wide && S.Bool("wide_bars")) arguments.Add("-AspectFit");
 		if (!S.Bool("redzone")) arguments.Add("-NoRedZone");
 		// (The 30 fps lock, Experimental: KYTY_FLIP_RATE=1 below, at 60 Hz: up to 120 fps it would be 60.)
 		if (S.Bool("fps120") && !S.Bool("fps30")) arguments.Add("-Fps120");
@@ -132,6 +135,8 @@ sealed class Commands {
 		// The audio output the game is told (it mixes for it; a TV when none is set, issue #207).
 		var audioOutput = S.Str("audio_output");
 		if (audioOutput == "headphones" || audioOutput == "amplifier" || audioOutput == "soundbar") sets.Add("KYTY_AUDIO_OUTPUT=" + audioOutput);
+		// The start-up logos skipped (the game's own switch, issue #263).
+		if (S.Bool("skip_logos")) sets.Add("KYTY_SKIP_LOGOS=1");
 		// The DualSense speaker's own volume (0 when the switch above is off; the haptics stay), then what a hit feels
 		// like: the motor drive as a percent of the mainline 2.0x, and the length of one drive report. Each is sent only
 		// when moved off the emulator's own default, so an untouched launcher plays exactly as before.

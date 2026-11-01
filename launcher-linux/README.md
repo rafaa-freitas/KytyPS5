@@ -25,6 +25,7 @@ can ask y/N and for the sudo password.
 | --- | --- | --- |
 | Display | Resolution | `--screen-width`, `--screen-height` |
 | | Aspect ratio 21:9, 32:9 | `KYTY_RENDER_ASPECT` |
+| | Movies and menus at 16:9 (black bars), with 21:9 or 32:9 | `KYTY_PRESENT_ASPECT=fit` |
 | | Fullscreen, keep the aspect ratio | `--fullscreen`, `KYTY_PRESENT_ASPECT=fit` |
 | | HDR | `--hdr` |
 | | Up to 120 fps | `KYTY_VBLANK=120` (run_ds.sh adds `gameMinDeltaTime`) |
@@ -43,6 +44,7 @@ can ask y/N and for the sudo password.
 | | AMD FSR 3 frame generation | `KYTY_FRAMEGEN=1`, `KYTY_FRAMEGEN_BACKEND=fsr` |
 | Game | Console language | `--console-language` |
 | | Audio output | `KYTY_AUDIO_OUTPUT` |
+| | Skip the start-up logos | `KYTY_SKIP_LOGOS=1` |
 | | Cheats | `--game-patch _Patches/<title id>.json`; Choose… sets the mods' `enabled` flags |
 | Shaders | Precompile, Quick, efficiency cores | `precompile-linux.sh --game … [--quick] [--cpus <E-cores>]` |
 | | Export shader hints | `precompile-linux.sh --export-hints` |

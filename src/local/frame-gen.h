@@ -174,6 +174,15 @@ void NoteCut();
 [[nodiscard]] bool SceneNoted();
 // The guest flips taken so far (TakeScene).
 [[nodiscard]] uint64_t GuestFlips();
+// Renderer thread (Kyty.Gpu), hud-anchor.h (MenuBars: the wide output with KYTY_PRESENT_ASPECT=fit): the guest frame drew
+// one of the game's menus (NoteMenu), and its interface went to the middle of the wide output at 16:9 (NoteCentred).
+// The guest flip takes them (Presenter::PrepareFrame): whether that frame's interface is in the middle, the part the
+// presenter shows between black bars.
+void NoteMenu();
+void NoteCentred();
+[[nodiscard]] bool TakeMenu();
+// The current guest frame drew a menu so far, or one of the last 20 flipped did (its fade out, TakeMenu).
+[[nodiscard]] bool MenuNoted();
 // The current guest frame has no camera yet: its next G-buffer draw goes the normal way (the table way's draws have
 // no constants on the CPU), whose hook reads it.
 [[nodiscard]] bool WantsCamera();

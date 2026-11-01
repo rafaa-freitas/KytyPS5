@@ -386,14 +386,101 @@ static class Native {
 			target = long.TryParse(parent, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out process) && process > 0
 				? LargestWindowOf((uint)process) : IntPtr.Zero;
 		if (target == IntPtr.Zero || GetForegroundWindow() == target) return;
-		if (SetForegroundWindow(target) && GetForegroundWindow() == target) return;
+		TakeForeground(target);
+	}
+
+	// `window` in front with the focus (Focus's way).
+	public static void TakeForeground(IntPtr window) {
+		if (SetForegroundWindow(window) && GetForegroundWindow() == window) return;
 		uint ignored;
 		var foreground = GetWindowThreadProcessId(GetForegroundWindow(), out ignored);
 		var self = GetCurrentThreadId();
 		if (foreground == 0 || foreground == self || !AttachThreadInput(self, foreground, true)) return;
-		BringWindowToTop(target);
-		SetForegroundWindow(target);
+		BringWindowToTop(window);
+		SetForegroundWindow(window);
 		AttachThreadInput(self, foreground, false);
+	}
+
+	[DllImport("user32.dll", CharSet = CharSet.Unicode)]
+	static extern int GetClassNameW(IntPtr window, System.Text.StringBuilder name, int length);
+
+	// The window in front, for the log: "window 0x..., '<class>' of <program>.exe", or "no window".
+	public static string ForegroundDescription() {
+		var window = GetForegroundWindow();
+		if (window == IntPtr.Zero) return "no window";
+		var name = new System.Text.StringBuilder(256);
+		GetClassNameW(window, name, name.Capacity);
+		uint process;
+		GetWindowThreadProcessId(window, out process);
+		string program = "?";
+		try {
+			using (var owner = System.Diagnostics.Process.GetProcessById((int)process)) program = owner.ProcessName + ".exe";
+		} catch (Exception) {
+		}
+		return string.Format(System.Globalization.CultureInfo.InvariantCulture, "window 0x{0:X}, '{1}' of {2}", window.ToInt64(), name, program);
+	}
+
+	// The program name of a process (ParentProcess's number), lower case without ".exe", or "".
+	public static string ProcessName(string id) {
+		int process;
+		if (!int.TryParse(id, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out process) || process <= 0)
+			return "";
+		try {
+			using (var owner = System.Diagnostics.Process.GetProcessById(process)) return owner.ProcessName.ToLowerInvariant();
+		} catch (Exception) {
+			return "";
+		}
+	}
+
+	[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+	struct StartupInfo {
+		public int cb;
+		public string lpReserved, lpDesktop, lpTitle;
+		public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+		public short wShowWindow, cbReserved2;
+		public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	struct ProcessInformation {
+		public IntPtr hProcess, hThread;
+		public int dwProcessId, dwThreadId;
+	}
+
+	[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+	static extern bool CreateProcessW(string application, System.Text.StringBuilder commandLine, IntPtr processAttributes,
+		IntPtr threadAttributes, bool inheritHandles, uint flags, IntPtr environment, string directory, ref StartupInfo startup,
+		out ProcessInformation information);
+
+	[DllImport("kernel32.dll")]
+	static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+
+	// `exe arguments` started outside the job this process is in: Steam counts a game as running while a process of its
+	// job lasts (issue #217). Broken away from the job where it allows that, else made by WMI's provider host
+	// (Win32_Process.Create), which is in no job. How it started (for the log), or null.
+	public static string StartOutsideJob(string exe, string arguments) {
+		const uint CreateBreakawayFromJob = 0x01000000;
+		var line = "\"" + exe + "\" " + arguments;
+		bool inJob;
+		if (!IsProcessInJob(System.Diagnostics.Process.GetCurrentProcess().Handle, IntPtr.Zero, out inJob)) inJob = true;
+		var startup = new StartupInfo { cb = Marshal.SizeOf(typeof(StartupInfo)) };
+		ProcessInformation information;
+		if (CreateProcessW(null, new System.Text.StringBuilder(line), IntPtr.Zero, IntPtr.Zero, false, inJob ? CreateBreakawayFromJob : 0,
+		                   IntPtr.Zero, null, ref startup, out information)) {
+			CloseHandle(information.hThread);
+			CloseHandle(information.hProcess);
+			return inJob ? "broken away from the game's job" : "started (the launcher was in no job)";
+		}
+		var refused = Marshal.GetLastWin32Error();
+		try {
+			using (var processes = new System.Management.ManagementClass("Win32_Process")) {
+				var result = processes.InvokeMethod("Create", new object[] { line, null, null, null });
+				if (Convert.ToInt32(result, System.Globalization.CultureInfo.InvariantCulture) == 0)
+					return "started by WMI (the job refused a break-away: error " + refused + ")";
+			}
+		} catch (Exception) {
+		}
+		return null;
 	}
 
 	[DllImport("kernel32.dll", SetLastError = true)]
