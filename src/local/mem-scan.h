@@ -21,6 +21,9 @@ void Next(uint64_t id, const std::string& value);
 void List(uint64_t id, uint32_t count);
 void PokeBytes(uint64_t id, uint64_t address, const std::string& hex);
 void Watch(uint64_t id, uint64_t address, uint32_t length, double seconds);
+// threads <seconds>: each thread's CPU time over the seconds (Windows), busiest first (LIVE_THREAD lines), and the
+// process's total: what competes with the game on a CPU with few cores.
+void ThreadCpu(uint64_t id, double seconds);
 
 } // namespace LocalMemScan
 

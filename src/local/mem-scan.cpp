@@ -321,4 +321,51 @@ void Watch(uint64_t id, uint64_t address, uint32_t length, double seconds) {
 #endif
 }
 
+void ThreadCpu(uint64_t id, double seconds) {
+#if defined(_WIN32)
+	struct Sample {
+		uint32_t    tid = 0;
+		std::string name;
+		uint64_t    start = 0, end = 0;
+	};
+	const auto cpu = [](uint32_t tid, uint64_t* time) {
+		HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+		if (thread == nullptr) return false;
+		FILETIME creation {}, exit {}, kernel {}, user {};
+		const bool ok = GetThreadTimes(thread, &creation, &exit, &kernel, &user) != 0;
+		CloseHandle(thread);
+		if (ok)
+			*time = ((uint64_t {kernel.dwHighDateTime} << 32u) | kernel.dwLowDateTime) +
+			        ((uint64_t {user.dwHighDateTime} << 32u) | user.dwLowDateTime);
+		return ok;
+	};
+	std::vector<Sample> samples;
+	for (const auto& [tid, name]: LocalPlatform::ProcessThreads()) {
+		Sample sample {tid, name};
+		if (cpu(tid, &sample.start)) samples.push_back(std::move(sample));
+	}
+	const auto begin = std::chrono::steady_clock::now();
+	std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+	const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+	double       total   = 0;
+	for (auto& sample: samples) {
+		if (!cpu(sample.tid, &sample.end)) sample.end = sample.start;
+		total += static_cast<double>(sample.end - sample.start);
+	}
+	std::sort(samples.begin(), samples.end(), [](const Sample& a, const Sample& b) { return a.end - a.start > b.end - b.start; });
+	// (Times in 100 ns units; percent of one core.)
+	for (const auto& sample: samples) {
+		const double percent = static_cast<double>(sample.end - sample.start) / (elapsed * 1e5);
+		if (percent < 0.5) break;
+		std::printf("LIVE_THREAD id=%" PRIu64 " tid=%u cpu=%.1f%% name=%s\n", id, sample.tid, percent,
+		            sample.name.empty() ? "-" : sample.name.c_str());
+	}
+	std::printf("LIVE_THREADS id=%" PRIu64 " seconds=%.2f threads=%zu total_cpu=%.1f%%\n", id, elapsed, samples.size(),
+	            total / (elapsed * 1e5));
+#else
+	(void)seconds;
+	std::printf("LIVE_ERROR id=%" PRIu64 " threads: Windows only\n", id);
+#endif
+}
+
 } // namespace LocalMemScan

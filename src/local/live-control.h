@@ -621,6 +621,8 @@ inline void Run(uint64_t id, const std::string& line) {
 		LocalMemScan::List(id, n >= 2 ? static_cast<uint32_t>(std::strtoul(arg1, nullptr, 10)) : 0);
 	} else if (cmd == "pokeb" && n == 3) {
 		LocalMemScan::PokeBytes(id, std::strtoull(arg1, nullptr, 16), arg2);
+	} else if (cmd == "threads" && n >= 2) {
+		LocalMemScan::ThreadCpu(id, std::strtod(arg1, nullptr));
 	} else if (cmd == "watch" && n == 3) {
 		char      seconds[64] {};
 		const int got = std::sscanf(line.c_str(), "%*s %*s %*s %63s", seconds);
