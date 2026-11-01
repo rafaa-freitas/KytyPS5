@@ -84,8 +84,8 @@ bool Matches(const uint8_t* at, Type type, uint32_t bits) {
 	}
 }
 
-// The guest's committed ranges the CPU writes and the GPU does not use (no read watchers, no write-backs): the
-// game's own data. (start, size), in order.
+// The guest's committed ranges the CPU writes, but the pages the GPU wrote (read faults): the game's data. (start,
+// size), in order.
 std::vector<std::pair<uint64_t, uint64_t>> DataRanges() {
 	std::vector<std::pair<uint64_t, uint64_t>> ranges;
 	uint64_t                                   version = 0;
@@ -101,7 +101,9 @@ std::vector<std::pair<uint64_t, uint64_t>> DataRanges() {
 			for (uint64_t at = start; at < start + size; at += Page) {
 				const uint64_t bytes = std::min(Page, start + size - at);
 				bool           gpu = false, cpu_write = false;
-				if (!Memory::GuestRangeAccess(at, bytes, &gpu, &cpu_write) || gpu || !cpu_write || Memory::ReadFaults(at, bytes))
+				// (The game's heap is GPU-visible memory too: only pages a read must not touch, those the GPU wrote, are left
+				// out; GuardedCopy stops at a page without access.)
+				if (!Memory::GuestRangeAccess(at, bytes, &gpu, &cpu_write) || !cpu_write || Memory::ReadFaults(at, bytes))
 					continue;
 				if (!ranges.empty() && ranges.back().first + ranges.back().second == at) {
 					ranges.back().second += bytes;
@@ -263,8 +265,9 @@ void PokeBytes(uint64_t id, uint64_t address, const std::string& hex) {
 	std::vector<uint8_t> bytes;
 	for (size_t i = 0; i + 1 < hex.size(); i += 2) bytes.push_back(static_cast<uint8_t>(std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16)));
 	bool gpu = false, cpu_write = false;
-	if (bytes.empty() || !Memory::GuestRangeAccess(address, bytes.size(), &gpu, &cpu_write) || gpu || !cpu_write) {
-		std::printf("LIVE_ERROR id=%" PRIu64 " pokeb: 0x%" PRIx64 " is not guest CPU data\n", id, address);
+	if (bytes.empty() || !Memory::GuestRangeAccess(address, bytes.size(), &gpu, &cpu_write) || !cpu_write ||
+	    Memory::ReadFaults(address, bytes.size())) {
+		std::printf("LIVE_ERROR id=%" PRIu64 " pokeb: 0x%" PRIx64 " is not guest CPU-writable data\n", id, address);
 		return;
 	}
 	std::memcpy(reinterpret_cast<void*>(address), bytes.data(), bytes.size());
