@@ -455,6 +455,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.cpp"
 	"${KYTY_SOURCE_DIR}/local/jit-arena.h"
 	"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
+	"${KYTY_SOURCE_DIR}/local/mem-scan.h"
+	"${KYTY_SOURCE_DIR}/local/mem-scan.cpp"
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 

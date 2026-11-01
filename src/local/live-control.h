@@ -29,6 +29,7 @@
 #include "live-trace.h"
 #include "libs/controller.h"
 #include "loader/demonsSoulsWarp.h"
+#include "mem-scan.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
 #include "screenshot.h"
@@ -610,6 +611,21 @@ inline void Run(uint64_t id, const std::string& line) {
 		// sync: GPU timelines, deferred submissions and pending guest readbacks (a stalled GPU thread).
 		if (LiveCounters::g_sync_report != nullptr) LiveCounters::g_sync_report();
 		std::printf("LIVE_SYNC id=%" PRIu64 "\n", id);
+	} else if (cmd == "scan" && n == 3) {
+		// scan <u8|u16|u32|f32> <value>, next <value>, list [count], pokeb <address> <hex>, watch <address> <len> <s>:
+		// finding a game value and the code that writes it (mem-scan.h).
+		LocalMemScan::Scan(id, arg1, arg2);
+	} else if (cmd == "next" && n >= 2) {
+		LocalMemScan::Next(id, arg1);
+	} else if (cmd == "list") {
+		LocalMemScan::List(id, n >= 2 ? static_cast<uint32_t>(std::strtoul(arg1, nullptr, 10)) : 0);
+	} else if (cmd == "pokeb" && n == 3) {
+		LocalMemScan::PokeBytes(id, std::strtoull(arg1, nullptr, 16), arg2);
+	} else if (cmd == "watch" && n == 3) {
+		char      seconds[64] {};
+		const int got = std::sscanf(line.c_str(), "%*s %*s %*s %63s", seconds);
+		LocalMemScan::Watch(id, std::strtoull(arg1, nullptr, 16), static_cast<uint32_t>(std::strtoul(arg2, nullptr, 10)),
+		                    got == 1 ? std::strtod(seconds, nullptr) : 10.0);
 	} else if (cmd == "gamecmd" && n >= 2) {
 		// gamecmd <text>: an engine console command on the game's pad-reading thread (loader/demonsSoulsWarp.h), e.g.
 		// gamecmd +cp11_unlockAllArchstones, gamecmd +cp11_loadLevel 2 1 (world, level: what archstone travel runs).
