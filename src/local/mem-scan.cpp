@@ -291,7 +291,16 @@ void Watch(uint64_t id, uint64_t address, uint32_t length, double seconds) {
 	std::printf("LIVE_WATCH id=%" PRIu64 " address=0x%" PRIx64 " length=%u threads=%u seconds=%g\n", id, address, length,
 	            threads, seconds);
 	std::fflush(stdout);
-	std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+	// Until the first write (and half a second more, for the writers of the same moment) or the time is up: a
+	// breakpoint left on through a level load slowed the load to a crawl.
+	const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+	while (std::chrono::steady_clock::now() < end) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		if (g_hits[0].rip.load(std::memory_order_relaxed) != 0) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(500));
+			break;
+		}
+	}
 	(void)SetBreakpoint(0, length);
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	g_watch_address.store(0);

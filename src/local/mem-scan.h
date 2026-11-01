@@ -5,7 +5,7 @@
 //   next <value>                    the candidates that hold the value now (a value changed in the game between)
 //   list [count]                    the candidates with their values (LIVE_SCAN_ITEM lines)
 //   pokeb <address> <hex bytes>     guest data bytes written (a candidate tried out)
-//   watch <address> <1|2|4|8> <s>   Windows: a hardware write breakpoint on every thread for <s> seconds: each
+//   watch <address> <1|2|4|8> <s>   Windows: a hardware write breakpoint on every thread until the first write (or <s>): each
 //                                   instruction that writes there, with its count (LIVE_WATCH_HIT rip= is the
 //                                   instruction after the write; eboot offsets are rip - 0x900000000)
 // Values are decimal (f32: a float); addresses hex.
