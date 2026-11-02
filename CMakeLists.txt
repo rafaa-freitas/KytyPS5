@@ -186,6 +186,22 @@ if(KYTY_STEAM_DECK)
 	add_compile_definitions(KYTY_STEAM_DECK=1)
 endif()
 
+# kytyTranslatorId.h: KYTY_TRANSLATOR_ID, what the shader prefetch cache keys on (generate_translator_id.cmake), made at
+# every build like kytyGitVersion.h and rewritten only when it changes.
+add_custom_target(KytyTranslatorId
+	COMMAND ${CMAKE_COMMAND}
+		-D SOURCE_DIR=${KYTY_SOURCE_DIR}
+		-D ROOT_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+		-D OUTPUT_FILE=${PROJECT_BINARY_DIR}/kytyTranslatorId.h
+		-D GIT_EXECUTABLE=${GIT_EXECUTABLE}
+		"-DSALT=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_SYSTEM_NAME} deck=${KYTY_STEAM_DECK}"
+		-P ${KYTY_SOURCE_DIR}/generate_translator_id.cmake
+	BYPRODUCTS ${PROJECT_BINARY_DIR}/kytyTranslatorId.h
+	COMMENT "Generate kytyTranslatorId.h"
+	VERBATIM
+)
+add_dependencies(kyty_git_version KytyTranslatorId)
+
 config_compiler_and_linker()
 
 if(KYTY_CLANG_CL)

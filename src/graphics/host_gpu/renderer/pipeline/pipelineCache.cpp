@@ -24,6 +24,7 @@
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
+#include "kytyTranslatorId.h"
 #include "loader/systemContent.h"
 #include "native-preparation-scratch.h"
 #include "native-resource-state.h"
@@ -903,15 +904,21 @@ struct PipelineCache::ProgramCache {
 		return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + std::string(suffix));
 	}
 
-	// What the translations are good for: the inputs' identity (the title, GPU and driver), this executable (its revision,
-	// size and time: another build may translate otherwise), the translation features, the compute subgroup size and the
-	// settings the translation reads. Empty when the executable's file cannot be told. KYTY_PREFETCH_CACHE_BUILD=<id> (a
-	// development build's: tools/local/deck gives the translator sources' hash) stands for the executable: builds with
-	// the same translator keep the cache (a Steam Deck translates ~1,200 programs again otherwise, for minutes).
+	// What the translations are good for: the inputs' identity (the title, GPU and driver), the translator (below), the
+	// translation features, the compute subgroup size and the settings the translation reads. The translator:
+	// KYTY_PREFETCH_CACHE_BUILD=<id> when set (tools/local/deck gives the translator sources' hash), else the build's
+	// KYTY_TRANSLATOR_ID (generate_translator_id.cmake: a hash of the translator's sources and what they read), so builds
+	// with the same translator keep the cache: an update that leaves it alone does not translate every program again
+	// (Demon's Souls: 20,000 programs, minutes of two busy cores and ~15% of the frame rate; a Steam Deck ~1,200).
+	// KYTY_PREFETCH_CACHE_EXE=1: this executable's revision, size and time instead (every build its own cache, as
+	// before). Empty when the executable's file cannot be told.
 	static std::string PrefetchCacheKey(const std::string& identity, uint32_t host_subgroup_size) {
 		std::string build;
+		const char* by_exe = std::getenv("KYTY_PREFETCH_CACHE_EXE");
 		if (const char* id = std::getenv("KYTY_PREFETCH_CACHE_BUILD"); id != nullptr && *id != 0) {
 			build = fmt::format("build {}", id);
+		} else if (std::string_view(KYTY_TRANSLATOR_ID).size() != 0 && (by_exe == nullptr || std::string_view(by_exe) != "1")) {
+			build = fmt::format("translator {}", KYTY_TRANSLATOR_ID);
 		} else {
 			const auto exe = LocalPlatform::ExecutablePath();
 			if (exe.empty()) return {};
