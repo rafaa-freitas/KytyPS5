@@ -50,8 +50,7 @@ $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false
 	ecores = $false; fps120 = $false; render = 1440; ratio = '16:9'; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0
 	hud = 0; streamline = ''; safegpu = $false; upscaler = ''; render_dlss = 1080; fsr = $false; output = 'auto'
 	lowlatency = $false; present_direct = $false; vrr_flips = $false; antilag = $false; keep_resident = $false; fps30 = $false; pad_speaker = $true
-	extra_args = ''; dlss_preset = ''; dlss_sharpness = ''; fsr_sharpness = ''; gpu = ''; output_auto = $true; audio_output = ''
-	skip_logos = $false }
+	extra_args = ''; dlss_preset = ''; dlss_sharpness = ''; fsr_sharpness = ''; gpu = ''; output_auto = $true; audio_output = '' }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -177,10 +176,15 @@ $rtxGpu = try {
 	[bool](Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' -and $_.Name -match '\bRTX\b' })
 } catch { $false }
 $frameGenAvailable = [bool]$streamline -and $rtxGpu
-# FSR 3.1 frame generation (run-windows -Fsr), any GPU: AMD's signed amd_fidelityfx_vk.dll next to the emulator.
-$fsrDll = Join-Path (Split-Path $exe) 'amd_fidelityfx_vk.dll'
-$fsrAvailable = (Test-Path -LiteralPath $fsrDll) -and
-	((Get-AuthenticodeSignature -LiteralPath $fsrDll).SignerCertificate.Subject -match 'O=Advanced Micro Devices')
+# FSR frame generation (run-windows -Fsr), any GPU: AMD's signed runtime next to the emulator, FSR SDK 2's loader with
+# its frame generation DLL, or FidelityFX SDK 1.1.4's amd_fidelityfx_vk.dll.
+function Test-AmdSigned([string]$name) {
+	$path = Join-Path (Split-Path $exe) $name
+	(Test-Path -LiteralPath $path) -and
+		((Get-AuthenticodeSignature -LiteralPath $path).SignerCertificate.Subject -match 'O=Advanced Micro Devices')
+}
+$fsrAvailable = ((Test-AmdSigned 'amd_fidelityfx_loader_vk.dll') -and (Test-AmdSigned 'amd_fidelityfx_framegeneration_vk.dll')) -or
+	(Test-AmdSigned 'amd_fidelityfx_vk.dll')
 
 # Cheats (_Patches\<title id>.json)
 # A GoldHEN-style mods file: every mod has a name, an enabled flag and the memory writes it makes.
@@ -416,8 +420,6 @@ function Get-PlayCommand {
 	if ($fsrUpscaler -and "$($settings.fsr_sharpness)" -in @('0', '0.3', '0.9')) { $sets += "KYTY_FSR_SHARPNESS=$($settings.fsr_sharpness)" }
 	# KytyLauncher.exe's audio output the game is told (issue #207; none: a TV).
 	if ("$($settings.audio_output)" -cmatch '^(headphones|amplifier|soundbar)$') { $sets += "KYTY_AUDIO_OUTPUT=$($settings.audio_output)" }
-	# KytyLauncher.exe's start-up logos skipped (the game's own switch, issue #263).
-	if ($settings.skip_logos) { $sets += 'KYTY_SKIP_LOGOS=1' }
 	# KytyLauncher.exe's extra options (Advanced page): their -Set pairs join (or replace) the launcher's own.
 	$extra = Get-ExtraOptions
 	foreach ($option in $extra) {
@@ -761,10 +763,10 @@ $frameGenFolder.Add_Click({
 	Update-UpscalerNote
 })
 Add-Row 'Frame generation' @($frameGen, $frameGenFolder, $frameGenNote)
-$fsr = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'AMD FSR 3 frame generation (2x, any GPU; instead of DLSS)'; AutoSize = $true
+$fsr = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'AMD FSR frame generation (2x, any GPU; instead of DLSS)'; AutoSize = $true
 	Checked = ($fsrAvailable -and [bool]$settings.fsr); Enabled = $fsrAvailable }
-(New-Object System.Windows.Forms.ToolTip).SetToolTip($fsr, "AMD FidelityFX FSR 3.1: one generated frame between two of the game's, from its depth and motion.`n" +
-	"With VSync on, the shown frames are capped at the display's refresh (a 60 Hz display runs the game at 30 fps).`nNeeds amd_fidelityfx_vk.dll next to the emulator.")
+(New-Object System.Windows.Forms.ToolTip).SetToolTip($fsr, "AMD FSR: one generated frame between two of the game's, from its depth and motion (FSR 4 on Radeon RX 9000 with the FSR SDK 2.4 runtime, FSR 3.1 otherwise).`n" +
+	"With VSync on, the shown frames are capped at the display's refresh (a 60 Hz display runs the game at 30 fps).`nNeeds AMD's FSR runtime next to the emulator: the FSR SDK 2.4 DLLs or amd_fidelityfx_vk.dll (README).")
 Add-Row '' @($fsr)
 $hud = New-Object System.Windows.Forms.ComboBox -Property @{ DropDownStyle = 'DropDownList'; Width = 160 }
 $hud.Items.AddRange($overlays)
