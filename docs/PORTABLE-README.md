@@ -144,7 +144,7 @@ at the render height and stretching to 4K. The launcher keeps a render height fo
 at 1080, DLSS's Performance (on an RTX 5090 about the frame rate of the game's own TAA at 1440, with a
 sharper picture); 1440 is its Quality, 1512 the PS5 Pro's own 2688x1512, 2160 DLAA. NVIDIA RTX only, with
 NVIDIA's Streamline runtime as for frame generation below: on a PC without an NVIDIA RTX graphics card (AMD,
-Intel, GeForce GTX) the launcher offers no DLSS. "FSR 3 (PS5 Pro path)" does the same with AMD's FSR 3 in place of
+Intel, GeForce GTX) the launcher offers no DLSS. "AMD FSR (PS5 Pro path)" does the same with AMD's FSR 3 in place of
 DLSS, on any graphics card, AMD and Intel included: it is built into the emulator, nothing to download
 (`run.cmd -Upscaler fsr`; on an RTX 5090 at Boletaria's start 75.8 fps from 1080 to 4K, a picture close to DLSS's).
 The render heights show their mode as with DLSS (FSR's "Native AA" at the output's own size). The in-game
@@ -184,11 +184,14 @@ runtime, which this package does not include: download the Streamline SDK (a rel
 https://github.com/NVIDIA-RTX/Streamline/releases), unpack it and choose its folder with the launcher's
 "Streamline..." button (only files signed by NVIDIA are loaded). The frames shown are the game's times the
 multiplier; with VSync they are capped at the display's refresh rate (a 60 Hz display at 2x runs the game at 30 fps).
-"FSR 3.1 frame generation" (2x, any graphics card, AMD included; `run.cmd -Fsr`) uses AMD's FidelityFX runtime,
-which this package does not include either: take `amd_fidelityfx_vk.dll` from the FidelityFX SDK 1.1.4
-(`PrebuiltSignedDLL` in https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v1.1.4) and put it next to
-`kyty_emulator.exe` (only a DLL signed by AMD is loaded); the launcher's FSR checkbox is enabled then. It takes the place of
-DLSS frame generation.
+"AMD FSR frame generation" (2x, any graphics card, AMD included; `run.cmd -Fsr`) uses AMD's FSR runtime, which this
+package does not include either: download AMD's FSR SDK 2.4 (the "Minimal package" of
+https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases/tag/v2.4.0) and put `amd_fidelityfx_loader_vk.dll`,
+`amd_fidelityfx_framegeneration_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` from its `Kits\FidelityFX\signedbin` next
+to `kyty_emulator.exe` (only DLLs signed by AMD are loaded); the launcher's FSR checkbox is enabled then. It takes the
+place of DLSS frame generation. With these DLLs a Radeon RX 9000 card gets FSR 4 frame generation, and with the
+upscaler set to FSR, RX 7000 and 9000 cards (RX 6000 too) get FSR 4 upscaling; other cards get FSR 3.1. The older
+`amd_fidelityfx_vk.dll` of the FidelityFX SDK 1.1.4 (FSR 3.1 frame generation) still works as well.
 "Overlay" (Off by default) shows the emulator's own panel at the top right of the game image: "Frame rate"
 the frames per second and a graph of the last frames' times (60 and 30 fps lines, hitches in red, the 1% low
 and the longest frame of the last 10 seconds); "Detailed" adds the render thread's time in each frame (orange),

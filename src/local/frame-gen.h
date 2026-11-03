@@ -126,6 +126,9 @@ void SetStaticRect(float x0, float y0, float x1, float y1);
 [[nodiscard]] bool UsesFsr();
 // FSR generates frames, by the Windows backend or built in (Linux): the interface canvas is looked for (NoteUiCanvas).
 [[nodiscard]] bool FsrMarksHud();
+// FSR's frame generation as the KYTY_FPS_HUD panel names it: "FSR 4" once AMD's runtime generates with FSR 4 (FSR SDK 2
+// on a Radeon RX 9000), else "FSR 3".
+[[nodiscard]] const char* FsrName();
 // The video memory frame generation and super resolution take beside the game's (FSR's or NGX's allocations, outside
 // the emulator's allocator, and the HUD images): what the emulator leaves them when it sizes its use of the budget
 // (small_video_memory). After the device: frame generation the device cannot run is not counted.
@@ -233,6 +236,11 @@ struct UpscaleInputs {
 	std::array<float, 16> view_to_clip {};                // row vectors (p' = p * M)
 	float        near_plane = 0.1f, far_plane = 3000.0f;
 };
+// Windows, AMD's FSR SDK 2 runtime next to the emulator (amd_fidelityfx_loader_vk.dll and its effect DLLs, frame-gen.cpp
+// FsrLoadRuntime): records AMD's upscaling of `inputs` into `command`, as fsr-native.h's Upscale takes them: FSR 4 on
+// the Radeon cards AMD lists for it (RX 7000 and 9000; from FSR 4.1.2 RX 6000 too), FSR 3.1 on the others. False without
+// that runtime, or once it failed (FSR 3 built in then). KYTY_FSR_RUNTIME=0: never.
+[[nodiscard]] bool UpscaleWithAmdRuntime(GraphicContext& graphics, vk::CommandBuffer command, const UpscaleInputs& inputs);
 // Streamline offers DLSS super resolution on this device.
 [[nodiscard]] bool UpscalerReady();
 // Streamline's DLSS super resolution without frame generation (Windows): every frame the game rendered goes to the
