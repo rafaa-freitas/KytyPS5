@@ -78,6 +78,8 @@ struct GraphicContext {
 	// its identity (pipelineCacheBlobs.h); in the precompile, its output.
 	const PipelineCacheBlobs*          pipeline_blobs                        = nullptr;
 	PipelineCacheBlobWriter*           pipeline_blob_writer                  = nullptr;
+	// A precompile is making pipelines: one the driver refuses is left out (shaders.cpp PipelineRefused).
+	bool                               precompiling                          = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
@@ -94,6 +96,7 @@ struct GraphicContext {
 	// copies (src/local/readback-queue.h); buffers are then shared with its family.
 	uint32_t                           readback_family = static_cast<uint32_t>(-1);
 	vk::Queue                          readback_queue  = nullptr;
+	Common::Mutex                      readback_queue_mutex; // (DeviceQueuesGuard; one thread submits at a time)
 	// Windows: a second queue of the graphics family used only for vkQueuePresentKHR. The
 	// driver can block a present in the kernel until earlier GPU work on its queue is done;
 	// on the graphics queue that held queue_mutex against the very submissions that work
@@ -228,6 +231,20 @@ private:
 	                            vk::ImageCreateFlags>,
 	                 std::pair<vk::Result, vk::ImageFormatProperties>>
 	    m_image_format_properties;
+};
+
+// Every queue the emulator submits to, held: a call that waits for the whole device (vkDeviceWaitIdle, as AMD's FSR
+// runtime does making and destroying its contexts) wants them left alone, and the validation layer caught the recording
+// worker submitting through it at an F11 (issue #174). Nothing new reaches the GPU meanwhile.
+class DeviceQueuesGuard {
+public:
+	// NOLINTNEXTLINE(google-runtime-references)
+	explicit DeviceQueuesGuard(GraphicContext& graphics)
+	    : m_queue(graphics.queue_mutex), m_readback(graphics.readback_queue_mutex), m_present(graphics.present_queue_mutex) {}
+	KYTY_CLASS_NO_COPY(DeviceQueuesGuard);
+
+private:
+	Common::LockGuard m_queue, m_readback, m_present;
 };
 
 struct VulkanImageState {

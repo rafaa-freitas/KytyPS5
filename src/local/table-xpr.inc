@@ -89,6 +89,13 @@ struct RenderExecutor::TableImageSet {
 	// (null: a dispatch): they stay in place while it does not move (UINT64_MAX: not yet).
 	uint64_t                  transit_epoch = UINT64_MAX;
 	const NativeXprDrawState* transit_state = nullptr;
+	// The sum of its images' serials then (KYTY_TABLE_SERIALS; UINT64_MAX: none), and transit_state's capture then.
+	uint64_t                  transit_serials  = UINT64_MAX;
+	uint64_t                  transit_capture  = 0;
+	// The images' ids alone, and whether one is a target of the state it was made under: what the serial sums and
+	// TableSetApart read (an Image holds an ImageDesc, lines of it).
+	std::vector<ImageId>      image_ids;
+	bool                      holds_target = false;
 	// The words select another specialization, or an image no set can hold: the draws take the native path
 	// (TableResolveSet tries again after TableImageSet::RetryFrames).
 	bool                  refused = false;
@@ -249,6 +256,27 @@ struct RenderExecutor::TableXpr {
 	size_t                    last_variant = 0;
 	const NativeXprDrawState* last_state   = nullptr;
 	const TableImageSet*      last_set     = nullptr; // the set the last emission bound
+	// KYTY_TABLE_MEMO: by pair and state key (direct-mapped), what a table draw of them drew with last: the variant's
+	// index, the draw state and the image set. Entries hold while memo_epoch does not move: every set retirement
+	// (NativeXprRetireSet), state sweep (TableForgetStates), pair sweep and reset moves it.
+	struct Memo {
+		const Pair*               pair    = nullptr;
+		uint64_t                  key     = 0;
+		uint64_t                  epoch   = 0;
+		const NativeXprDrawState* state   = nullptr;
+		TableImageSet*            set     = nullptr;
+		uint32_t                  variant = 0;
+	};
+	static constexpr size_t     MemoEntries = 4096;
+	std::array<Memo, MemoEntries> memo {};
+	uint64_t                    memo_epoch  = 1;
+	TableImageSet*              memo_set    = nullptr; // TableSet's first try for the draw being made
+	// KYTY_TABLE_MEMO_VERIFY: memo hits counted (every Nth checked), and whether TableSet checks the memo's set.
+	uint64_t                    memo_verify_count = 0;
+	bool                        memo_verify       = false;
+	[[nodiscard]] Memo& MemoAt(const Pair* pair, uint64_t key) {
+		return memo[((reinterpret_cast<uintptr_t>(pair) * 0x9e3779b97f4a7c15ull) ^ (key * 0xc2b2ae3d27d4eb4full)) >> 52u];
+	}
 	uint64_t                  images_epoch = 0;       // TextureCache::ImagesEpoch after it
 	// The game buffer the last arguments came from, and the indices' by their address (each mesh has its own): used
 	// again while no registration changed and the guest wrote none of its region (ObtainBuffer then returns the same
@@ -320,6 +348,22 @@ struct RenderExecutor::TableXpr {
 	std::array<std::vector<ShaderRecompiler::IR::DescriptorValue>, 2> indirect;
 	ShaderRecompiler::IR::AddressProbeCandidates                      probe;
 };
+// KYTY_TABLE_MEMO: a descriptor set left service (NativeXprRetireSet): a memo entry may hold it.
+void RenderExecutor::TableMemoRetired() {
+	if (m_table_xpr) ++m_table_xpr->memo_epoch;
+}
+// KYTY_TABLE_MEMO_VERIFY: a memo hit checked; `differ`: 1 the variant, 2 the draw state, 4 the image set the full path
+// found were not the memo's.
+static void TableMemoChecked(uint32_t differ, uint64_t vs, uint64_t ps, uint64_t key) {
+	if (differ == 0) return;
+	LiveCounters::Add(LiveCounters::TableMemoMismatch);
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+		std::printf("TABLE_MEMO_MISMATCH vs=0x%llx ps=0x%llx key=0x%llx variant=%d state=%d set=%d\n",
+		            static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps),
+		            static_cast<unsigned long long>(key), (differ & 1u) != 0 ? 1 : 0, (differ & 2u) != 0 ? 1 : 0,
+		            (differ & 4u) != 0 ? 1 : 0);
+}
 
 // A draw pair's key as TableTry hashes it (the scout's view directory too).
 template <typename Pair>
@@ -333,6 +377,7 @@ static uint64_t TableScoutHash(const Pair& pair) {
 void RenderExecutor::TableReset(TablePair& pair) {
 	if (pair.scout_version != 0) Scout::Retire(TableScoutHash(pair), pair.scout_version);
 	auto& table = *m_table_xpr;
+	++table.memo_epoch;
 	for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
 	if (table.store == &pair) table.store = nullptr;
 	if (table.last_pair == &pair) table.last_pair = nullptr;
@@ -346,6 +391,7 @@ void RenderExecutor::TableReset(TablePair& pair) {
 void RenderExecutor::TableForgetStates() {
 	auto* table = m_table_xpr.get();
 	if (table == nullptr) return;
+	++table->memo_epoch;
 	table->last_pair  = nullptr;
 	table->last_state = nullptr;
 	table->last_set   = nullptr;
@@ -353,8 +399,9 @@ void RenderExecutor::TableForgetStates() {
 		for (auto& [key, pair]: *pairs)
 			for (auto& [words, set]: pair.sets)
 				if (set->transit_state != nullptr) {
-					set->transit_state = nullptr;
-					set->transit_epoch = UINT64_MAX;
+					set->transit_state   = nullptr;
+					set->transit_epoch   = UINT64_MAX;
+					set->transit_serials = UINT64_MAX;
 				}
 }
 
@@ -381,6 +428,7 @@ void RenderExecutor::TableSweepPairs() {
 		});
 	const size_t after = table->pairs.size() + table->dispatches.size();
 	if (after == before) return;
+	++table->memo_epoch;
 	table->pair_cache         = {};
 	table->found_key          = {};
 	table->found_pair         = nullptr;
@@ -536,6 +584,62 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		table.store_state = cache.state_key;
 		return TableResult::Store;
 	};
+	// KYTY_TABLE_MEMO: what this pair and state key drew with last (the main executor's), its variant still that key's.
+	const bool memo = TableMemoOn();
+	if (memo) {
+		auto& entry = table.MemoAt(&pair, cache.state_key);
+		if (entry.pair == &pair && entry.key == cache.state_key && entry.epoch == table.memo_epoch &&
+		    entry.variant < pair.variants.size() && pair.programs[0] != nullptr) {
+			auto& memo_variant = pair.variants[entry.variant];
+			// KYTY_TABLE_MEMO_VERIFY: every Nth hit, what the full path below finds (the variant by its hint or the
+			// find, the draw state by the cache or the states' find; read only) against the entry's. A difference
+			// drops the entry and the draw takes the full path.
+			bool verify = false, differs = false;
+			if (const auto every = TableMemoVerifyEvery();
+			    every > 0 && memo_variant.state == cache.state_key && memo_variant.pipeline != nullptr &&
+			    !memo_variant.refused && ++table.memo_verify_count % static_cast<uint64_t>(every) == 0) {
+				verify           = true;
+				const bool hinted = (kyty_local_table_mru.load(std::memory_order_relaxed) & 2u) != 0 &&
+				                    pair.variant_hint < pair.variants.size() &&
+				                    pair.variants[pair.variant_hint].state == cache.state_key;
+				const auto full_variant =
+				    hinted ? pair.variant_hint
+				           : static_cast<uint32_t>(std::ranges::find(pair.variants, cache.state_key, &TableXpr::Variant::state) -
+				                                   pair.variants.begin());
+				const NativeXprDrawState* full_state = nullptr;
+				if (cache.last_state != nullptr && cache.last_state_key == cache.state_key) {
+					full_state = cache.last_state;
+				} else {
+					const auto& states   = NativeXprState().states;
+					const auto  state_it = states.find(cache.state_key);
+					if (state_it != states.end()) full_state = state_it->second.get();
+				}
+				LiveCounters::Add(LiveCounters::TableMemoVerified);
+				const uint32_t differ = (full_variant != entry.variant ? 1u : 0u) | (full_state != entry.state ? 2u : 0u);
+				TableMemoChecked(differ, pair.vs, pair.ps, cache.state_key);
+				if (differ != 0) {
+					differs     = true;
+					entry.epoch = 0;
+				}
+			}
+			if (!differs && memo_variant.state == cache.state_key && memo_variant.pipeline != nullptr &&
+			    !memo_variant.refused) {
+				const auto& memo_state = *entry.state;
+				pair.variant_hint      = entry.variant;
+				TablePrefetchArrays(pair, pair.last_set);
+				if (!NativeXprTargetsCurrent(memo_state))
+					return LiveCounters::Add(LiveCounters::TableStoreTargets), request_store();
+				LiveCounters::Add(LiveCounters::TableMemoHits);
+				table.memo_set     = entry.set;
+				table.memo_verify  = verify;
+				const auto result  = TableDraw(buffer, pair, memo_variant, memo_state, commands, index_base, index_bytes,
+				                               index_type, direct);
+				table.memo_set     = nullptr;
+				table.memo_verify  = false;
+				return result;
+			}
+		}
+	}
 	// (The variant found last first: a pair's variants are a cold line each, its draws mostly keep their state.)
 	const bool hint    = (kyty_local_table_mru.load(std::memory_order_relaxed) & 2u) != 0 &&
 	                  pair.variant_hint < pair.variants.size() && pair.variants[pair.variant_hint].state == cache.state_key;
@@ -556,7 +660,12 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	const auto& draw_state = *cache.last_state;
 	TablePrefetchArrays(pair, pair.last_set);
 	if (!NativeXprTargetsCurrent(draw_state)) return LiveCounters::Add(LiveCounters::TableStoreTargets), request_store();
-	return TableDraw(buffer, pair, *variant, draw_state, commands, index_base, index_bytes, index_type, direct);
+	const auto result = TableDraw(buffer, pair, *variant, draw_state, commands, index_base, index_bytes, index_type, direct);
+	if (memo && result == TableResult::Drawn)
+		table.MemoAt(&pair, cache.state_key) = {&pair, cache.state_key, table.memo_epoch, &draw_state,
+		                                        const_cast<TableImageSet*>(table.last_set),
+		                                        static_cast<uint32_t>(variant - pair.variants.begin())};
+	return result;
 }
 
 bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
@@ -776,7 +885,14 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 		}
 		if (st == 0) set->images.reserve(deps[0].size() + deps[1].size());
 		for (const auto& dep: deps[st])
-			if (dep.layout != vk::ImageLayout::eUndefined) set->images.push_back(dep);
+			if (dep.layout != vk::ImageLayout::eUndefined) {
+				set->images.push_back(dep);
+				set->image_ids.push_back(dep.id);
+				set->holds_target |= dep.target;
+				// (Its view's metadata, which may not be the image's own: KYTY_TABLE_SERIALS.)
+				if (dep.desc.info.metadata.kind != ImageMetadataKind::None)
+					m_context.GetTextureCache().NoteMetaUse(dep.desc.info.metadata.range.address, dep.id.index);
+			}
 	}
 	set->set = NativeXprAllocateSet((variant != nullptr      ? variant->pipeline
 	                                 : set->pipeline != nullptr ? set->pipeline
@@ -1149,8 +1265,24 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	if (set == nullptr || set->words != words) {
 		auto* const last     = set;
 		auto* const previous = pair.previous_set;
+		auto* const memo     = std::exchange(table.memo_set, nullptr); // (KYTY_TABLE_MEMO: the set the pair and key drew with)
+		const bool  verify   = std::exchange(table.memo_verify, false);
+		if (memo != nullptr && memo != last && !memo->refused && memo->words == words) {
+			set = memo;
+			// (KYTY_TABLE_MEMO_VERIFY: the set the words' lookup finds, read only; another one is taken as the full
+			// path would take it.)
+			if (verify) {
+				const auto found = pair.sets.find(XXH3_64bits(words.data(), words.size() * sizeof(uint32_t)));
+				auto* const full = found != pair.sets.end() && found->second->words == words ? found->second.get() : nullptr;
+				if (full != memo) {
+					TableMemoChecked(4u, pair.vs, pair.ps, 0);
+					set = full;
+					if (set == nullptr || (set->refused && frame >= set->validated_frame + TableImageSet::RetryFrames))
+						set = TableResolveSet(buffer, pair, variant, draw_state, words);
+				}
+			}
 		// (The set before the last next, without the words' hash or the map's cold bucket and node.)
-		if ((kyty_local_table_mru.load(std::memory_order_relaxed) & 4u) != 0 && previous != nullptr && previous != last &&
+		} else if ((kyty_local_table_mru.load(std::memory_order_relaxed) & 4u) != 0 && previous != nullptr && previous != last &&
 		    !previous->refused && previous->words == words) {
 			set = previous;
 		} else {
@@ -1541,6 +1673,37 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 	}
 	auto& resources = m_context.GetGpuResources();
 	if (!bounded || !resources.PrepareBdaReadRanges(ranges)) resources.PrepareBda();
+}
+
+// KYTY_TABLE_SERIALS=2: a check the serial sums would have skipped that changed something (the first 32 printed).
+static void TableSerialsUnsafe(const char* what) {
+	static std::atomic<uint32_t> count {0};
+	LiveCounters::Add(LiveCounters::SerialsUnsafe);
+	if (const auto n = count.fetch_add(1, std::memory_order_relaxed); n < 32)
+		std::printf("TABLE-SERIALS UNSAFE: %s (%u)\n", what, n + 1);
+}
+
+// The image serial sums (ImageSerials) of a draw state's targets and of a set's images, with the unattributed serial.
+template<typename State> // (RenderExecutor::NativeXprDrawState)
+static uint64_t TableTargetSerials(const State& draw_state) {
+	uint64_t sum = ImageSerials::Unattributed();
+	for (const auto id: draw_state.target_ids) sum += ImageSerials::Read(id.index);
+	return sum;
+}
+template<typename Set> // (RenderExecutor::TableImageSet)
+static uint64_t TableSetSerials(const Set& set) {
+	uint64_t sum = ImageSerials::Unattributed();
+	for (const auto id: set.image_ids) sum += ImageSerials::Read(id.index);
+	return sum;
+}
+// A set transited under another draw state is in place under this one when it holds no target of either: TableTransit
+// asks the state only which of the set's images it targets.
+template<typename Set, typename State>
+static bool TableSetApart(const Set& set, const State& draw_state) {
+	if (set.holds_target) return false;
+	for (const auto id: set.image_ids)
+		if (std::ranges::find(draw_state.target_ids, id) != draw_state.target_ids.end()) return false;
+	return true;
 }
 
 // A set's images in their layouts (other work may have moved them since the set was last bound), a DCC image's
@@ -1979,18 +2142,46 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	const auto images_epoch  = texture_cache.ImagesEpoch();
 	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
 	                      table.images_epoch == images_epoch;
+	// KYTY_TABLE_SERIALS: the checks again only when a serial sum moved (1), or as before with the sums counted (2).
+	const auto serials = TableSerialsMode();
 	if (!in_place) {
 		// The same for the targets apart, as this draw state's last emission left them, and the set's images, as its
 		// last transit under this state did (the passes alternate materials: another set or state in between).
-		if (draw_state.emitted_epoch != images_epoch && !NativeXprEmitTargets(draw_state, vk_buffer))
+		const bool epoch_targets = draw_state.emitted_epoch != images_epoch;
+		const auto targets_sum   = serials != 0 ? TableTargetSerials(draw_state) : 0;
+		const bool sum_targets   = draw_state.emitted_serials != targets_sum;
+		const bool due_targets   = serials == 1 ? sum_targets : epoch_targets;
+		if (serials != 0 && epoch_targets != sum_targets)
+			LiveCounters::Add(sum_targets ? LiveCounters::SerialsExtra : LiveCounters::SerialsSkipped);
+		if (due_targets && !NativeXprEmitTargets(draw_state, vk_buffer)) {
+			if (serials == 2 && !sum_targets) TableSerialsUnsafe("targets refused");
 			return LiveCounters::Add(LiveCounters::TableDrawNative), TableResult::Native;
+		}
+		if (serials == 2 && due_targets && !sum_targets && TableTargetSerials(draw_state) != targets_sum)
+			TableSerialsUnsafe("targets moved");
 		// The set's images in their layouts (a DCC image's pending fast clear applied first).
-		if ((set->transit_epoch != images_epoch || set->transit_state != &draw_state) &&
-		    !TableTransit(*set, vk_buffer, &draw_state))
+		const bool epoch_transit = set->transit_epoch != images_epoch || set->transit_state != &draw_state;
+		const auto set_sum       = serials != 0 ? TableSetSerials(*set) : 0;
+		const bool sum_transit   = set->transit_serials != set_sum ||
+		                         ((set->transit_state != &draw_state || set->transit_capture != draw_state.capture_id) &&
+		                          !TableSetApart(*set, draw_state));
+		const bool due_transit   = serials == 1 ? sum_transit : epoch_transit;
+		if (serials != 0 && epoch_transit != sum_transit)
+			LiveCounters::Add(sum_transit ? LiveCounters::SerialsExtra : LiveCounters::SerialsSkipped);
+		if (due_transit && !TableTransit(*set, vk_buffer, &draw_state)) {
+			if (serials == 2 && !sum_transit) TableSerialsUnsafe("transit refused");
 			return LiveCounters::Add(LiveCounters::TableDrawNative), TableResult::Native;
+		}
+		if (serials == 2 && due_transit && !sum_transit && TableSetSerials(*set) != set_sum)
+			TableSerialsUnsafe("transit moved");
 		// (Neither moves what the other placed: a target is no image the set holds as a texture.)
 		draw_state.emitted_epoch = set->transit_epoch = texture_cache.ImagesEpoch();
 		set->transit_state       = &draw_state;
+		set->transit_capture     = draw_state.capture_id;
+		if (serials != 0) {
+			draw_state.emitted_serials = due_targets || due_transit ? TableTargetSerials(draw_state) : targets_sum;
+			set->transit_serials       = due_targets || due_transit ? TableSetSerials(*set) : set_sum;
+		}
 	}
 	m_context.GetCommandScheduler().BeginRendering(draw_state.rendering);
 	if (same_command && emit.state != &draw_state && emit.state != nullptr &&
@@ -2053,8 +2244,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader);
 	}
-	emit.command     = vk_buffer;
-	emit.generation  = buffer.GraphicsGeneration();
+	emit.MovedTo(vk_buffer, buffer.GraphicsGeneration());
 	emit.state       = &draw_state;
 	emit.pipeline    = &pipeline;
 	draw_state.Use(m_context.FrameNumber());

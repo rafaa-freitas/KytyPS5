@@ -4,6 +4,7 @@
 #include "native-buffer-residency.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "live-switch.h"
 #include "live-trace.h"
 #include "live-trace-gpu.h"
 #include "native-resource-state.h"
@@ -45,6 +46,8 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {1};
 volatile std::atomic<uint32_t> kyty_local_async_lod_stats_mode {1};
 // 1: shader constants stream through a host-visible upload ring.
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_stream_upload_mode {1};
+// KYTY_UPLOAD_LANES (local/async-upload.h): 1 = one upload lane (default), 2 = two, 3 = two with the order checks.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_upload_lanes {1};
 extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 }
 
@@ -69,6 +72,7 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <string>
 #include <memory>
@@ -888,6 +892,14 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 		feedback.download.written_serial = m_scheduler.CommandSerial();
 		command.CopyAfterRun(owner->Handle(), owner->Offset(vaddr), feedback.download.Handle(),
 		                     selected * CopyFeedback::SlotSize, size);
+	} else if (static auto& batch = LiveSwitch::Find("feedback_batch", 0); batch.load(std::memory_order_relaxed) != 0) {
+		// KYTY_FEEDBACK_BATCH (live feedback_batch, default off): the snapshot is copied
+		// as the open buffer closes, with the others there behind one barrier each side, not behind two of its own
+		// here. Later work in the buffer that writes the range invalidates the slot (InvalidateCopyFeedback), so what
+		// the copy reads then is what it would read here whenever the slot is still used. (The source outlives the
+		// buffer: DeleteBuffer defers.)
+		feedback.download.written_serial = m_scheduler.CommandSerial();
+		m_feedback_batch.push_back({owner->Handle(), owner->Offset(vaddr), selected * CopyFeedback::SlotSize, size});
 	} else {
 		feedback.download.CopyFrom(command, *owner, owner->Offset(vaddr), selected * CopyFeedback::SlotSize, size,
 		                           vk::AccessFlagBits::eMemoryWrite,
@@ -898,6 +910,134 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 	slot = {vaddr, size, m_scheduler.CurrentTick(), mapping_epoch, owner->Handle()};
 	if (feedback.Insert(vaddr, selected)) feedback.Count(slot, 1);
 	feedback.cursor = (selected + 1) % CopyFeedback::SlotCount;
+	if (static auto& eager = LiveSwitch::Find("eager_feedback", 0);
+	    eager.load(std::memory_order_relaxed) != 0) {
+		if (m_eager_feedback.size() >= CopyFeedback::SlotCount) m_eager_feedback.pop_front();
+		m_eager_feedback.push_back({selected, vaddr, size, slot.tick});
+	}
+}
+
+// KYTY_EAGER_FEEDBACK. A snapshot is written back only once its tick completed and while its slot still holds it: a
+// later GPU write over the range invalidates the slot (InvalidateCopyFeedback), so no later write is in flight.
+// TryGuestReadFromFeedback publishes only GPU-modified, CPU-clean bytes and unprotects as a fault's read would.
+void BufferCache::WriteBackCompletedFeedback(bool may_wait) {
+	// (Called between guest packets: nothing to do until the oldest snapshot's tick completes.)
+	if (m_eager_feedback.empty() || m_eager_feedback.front().tick > m_scheduler.GetMasterSemaphore().KnownGpuTick()) return;
+	static auto& eager  = LiveSwitch::Find("eager_feedback", 0);
+	static auto& verify = LiveSwitch::Find("eager_feedback_verify", 0);
+	if (eager.load(std::memory_order_relaxed) == 0 || !m_copy_feedback) {
+		m_eager_feedback.clear();
+		return;
+	}
+	const auto completed = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	while (!m_eager_feedback.empty() && m_eager_feedback.front().tick <= completed) {
+		const auto entry = m_eager_feedback.front();
+		m_eager_feedback.pop_front();
+		const auto& slot = m_copy_feedback->slots[entry.slot];
+		if (slot.address != entry.address || slot.tick != entry.tick) {
+			LiveCounters::Add(LiveCounters::EagerStale);
+		} else if (!IsRegionRegistered(entry.address, entry.size) ||
+		           !m_memory_tracker.IsRegionGpuModified(entry.address, entry.size)) {
+			LiveCounters::Add(LiveCounters::EagerClean);
+		} else if (const auto every = verify.load(std::memory_order_relaxed);
+		           may_wait && every > 0 && ++m_eager_verify_count % static_cast<uint64_t>(every) == 0 &&
+		           VerifyEagerFeedback(entry)) {
+			LiveCounters::Add(LiveCounters::EagerWritten);
+		} else if (TryGuestReadFromFeedback(entry.address, entry.size, false)) {
+			LiveCounters::Add(LiveCounters::EagerWritten);
+		} else {
+			LiveCounters::Add(LiveCounters::EagerRefused);
+		}
+	}
+}
+
+// KYTY_EAGER_FEEDBACK_VERIFY (live eager_feedback_verify N, default 0): every Nth write-back, the snapshot's bytes
+// against what a fault's read would fetch with no snapshot at that moment: the source buffer's GPU-written bytes read
+// back now (DownloadBufferMemory, synchronous: the verify arm's time is not the lever's). Those bytes, read back, are
+// what the guest gets; a byte the snapshot holds otherwise is counted (eager_mismatch, a line for the first 8). False
+// when it did not run (the write-back then as usual).
+bool BufferCache::VerifyEagerFeedback(const EagerFeedback& entry) {
+	auto&      feedback = *m_copy_feedback;
+	const auto begin    = entry.address & ~(TRACKER_PAGE_SIZE - 1);
+	const auto end      = (entry.address + entry.size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	if (m_scheduler.Current().InCopyRun()) return false;
+	for (const auto& pending: m_guest_readbacks)
+		if (pending && pending->begin < end && begin < pending->begin + pending->size) return false;
+	auto& buffer = m_slot_buffers[FindBuffer(entry.address, entry.size)];
+	if (!buffer.IsInBounds(begin, end - begin)) return false;
+	// Every GPU-written byte of its pages read back (the protection goes for the pages whole, as a fault's read would
+	// drop it); the snapshot compared over its own range, the GPU-written bytes in it.
+	std::vector<DownloadCopy> copies;
+	m_gpu_modified_ranges.ForEachIntersection(begin, end - begin, [&](RangeSet::Range range) {
+		copies.push_back({&buffer, buffer.Offset(range.address), range.address, range.size});
+	});
+	if (copies.empty()) return false;
+	struct Compared {
+		uint64_t address, size, at;
+	};
+	std::vector<Compared> compared;
+	std::vector<uint8_t>  snapshot;
+	for (const auto& copy: copies) {
+		const auto first = std::max(copy.address, entry.address);
+		const auto last  = std::min(copy.address + copy.size, entry.address + entry.size);
+		if (first >= last) continue;
+		const auto offset = entry.slot * CopyFeedback::SlotSize + (first - entry.address);
+		feedback.download.Invalidate(offset, last - first);
+		const auto* from = feedback.download.Mapped().data() + offset;
+		compared.push_back({first, last - first, snapshot.size()});
+		snapshot.insert(snapshot.end(), from, from + (last - first));
+	}
+	LiveCounters::Add(LiveCounters::SyncDownloads);
+	DownloadBufferMemory(copies);
+	uint64_t mismatched = 0;
+	for (const auto& part: compared) {
+		const auto* now = LibKernel::Memory::TryGetBackingPointer(part.address, part.size);
+		if (now == nullptr) continue; // (unmapped meanwhile: nothing to compare)
+		for (uint64_t i = 0; i < part.size; ++i) mismatched += now[i] != snapshot[part.at + i] ? 1u : 0u;
+	}
+	{
+		const std::unique_lock lock(m_gpu_modified_mutex);
+		m_gpu_modified_ranges.SubtractSorted(copies);
+		++m_gpu_coverage_epoch;
+	}
+	m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
+	LiveCounters::Add(LiveCounters::EagerVerified);
+	if (mismatched != 0) {
+		LiveCounters::Add(LiveCounters::EagerMismatch);
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8)
+			std::printf("EAGER_FEEDBACK_MISMATCH address=0x%llx size=0x%llx bytes=%llu tick=%llu\n",
+			            static_cast<unsigned long long>(entry.address), static_cast<unsigned long long>(entry.size),
+			            static_cast<unsigned long long>(mismatched), static_cast<unsigned long long>(entry.tick));
+	}
+	return true;
+}
+
+void BufferCache::FlushFeedbackBatch(CommandBuffer& command) {
+	if (m_feedback_batch.empty()) return;
+	const auto native = command.Handle();
+	// As Buffer::CopyFrom's barriers, once for the batch: what wrote the sources (and the host's reads of the slots)
+	// before the copies, the copies before what reads the slots after (the host).
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostRead;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion, 1, &before, 0, nullptr,
+	                       0, nullptr);
+	const vk::Buffer destination = m_copy_feedback->download.Handle();
+	for (const auto& copy: m_feedback_batch) {
+		const vk::BufferCopy region {copy.source_offset, copy.destination_offset, copy.size};
+		native.copyBuffer(copy.source, destination, 1, &region);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask =
+	    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                       vk::DependencyFlagBits::eByRegion, 1, &after, 0, nullptr, 0, nullptr);
+	LiveCounters::Add(LiveCounters::FeedbackBatches);
+	m_feedback_batch.clear();
 }
 
 bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size) {
@@ -1030,6 +1170,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 	// Region requests prove their state against the registration epoch of their own region: only the
 	// requests of these regions need to be synchronized again.
+	// (The upload lanes split protections by this region: its region managers' and the page manager's locks.)
+	static_assert(AsyncUpload::Worker::LaneRegion == TRACKER_REGION_SIZE);
 	for (auto region = m_slot_buffers[id].CpuAddress() / TRACKER_REGION_SIZE,
 	          last   = (m_slot_buffers[id].CpuAddress() + m_slot_buffers[id].Size() - 1) / TRACKER_REGION_SIZE;
 	     region <= last && region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE; ++region) {
@@ -1440,6 +1582,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		m_bda_table.store(m_bda_tables.back().get(), std::memory_order_release);
 	}
 	m_scheduler.SetPrologueHook([this](vk::CommandBuffer command) { FlushPrologueCopies(command); });
+	m_scheduler.SetEpilogueHook([this](CommandBuffer& command) { FlushFeedbackBatch(command); });
 	m_gpu_modified_ranges.AllowFastPath();
 	g_sync_cache = this;
 	LiveCounters::g_sync_report = [] {

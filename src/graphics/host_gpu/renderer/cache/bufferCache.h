@@ -135,6 +135,11 @@ public:
 	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
+	// KYTY_EAGER_FEEDBACK (live eager_feedback, default off: fps flat in PR #300): GPU thread, the copy-feedback
+	// snapshots whose tick has completed are written back to guest memory now (TryGuestReadFromFeedback, as a fault's
+	// read would), before a guest read faults on them. `may_wait`: between guest packets, where a synchronous download
+	// may run (the verify's).
+	void WriteBackCompletedFeedback(bool may_wait);
 	// GPU thread: retire a pending guest read before touching overlapping backing.
 	// With no range, drain before mapping changes, unknown BDA access, or shutdown.
 	// `gpu_write`: the range is about to be written by the GPU again; a read whose
@@ -313,6 +318,21 @@ private:
 	[[nodiscard]] bool TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool is_write);
 	std::unique_ptr<CopyFeedback> m_copy_feedback;
+	// KYTY_EAGER_FEEDBACK: the snapshots scheduled, in tick order.
+	struct EagerFeedback {
+		size_t   slot;
+		uint64_t address, size, tick;
+	};
+	std::deque<EagerFeedback> m_eager_feedback;
+	uint64_t                  m_eager_verify_count = 0;
+	[[nodiscard]] bool        VerifyEagerFeedback(const EagerFeedback& entry);
+	// KYTY_FEEDBACK_BATCH: the open buffer's copy-feedback snapshots, recorded together as it closes (FlushFeedbackBatch).
+	struct FeedbackCopy {
+		vk::Buffer source;
+		uint64_t   source_offset, destination_offset, size;
+	};
+	std::vector<FeedbackCopy> m_feedback_batch;
+	void                      FlushFeedbackBatch(CommandBuffer& command);
 	bool TryReportLodStatsOnGpu(uint64_t address, bool reset);
 	vk::Pipeline m_lod_pack_pipeline = nullptr;
 	vk::PipelineLayout m_lod_pack_layout = nullptr;

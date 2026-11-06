@@ -621,7 +621,11 @@ static bool GuardedWrite(void* dst, const void* src, uint32_t size) {
 // the buffers those copies read at once, and a copy made after that took the new bytes for the earlier draws (issue
 // #196: lit ground and water flickered white; the frame boundary's wait, 5c6f80fa, came after the labels).
 static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
-	if (GuardedWrite(dst, src, size)) return;
+	if (GuardedWrite(dst, src, size)) {
+		// (The scout sees a guarded write as an unguarded one: its bytes from `src`, guest memory may not show them yet.)
+		if (Scout::Running()) Scout::NoteWrite(dst, size, src);
+		return;
+	}
 	AsyncUpload::Drain(/*serve=*/true);
 	std::memcpy(dst, src, size);
 	if (Scout::Running()) Scout::NoteWrite(dst, size);
@@ -820,7 +824,8 @@ void GuestGpu::ThreadRun(void* data) {
 #if defined(__linux__)
 	// KYTY_WRITE_GUARD with the userfaultfd write watch (KYTY_UFFD_WP=1, the Steam Deck build's default unless 0;
 	// sysLinuxVirtual.cpp WriteWatchInit): the GPU thread faulted forever on a WAIT_REG_MEM label read before the menu
-	// (issue #289, the cause not found yet). The guard stays off with it.
+	// (issue #289: a view page's protection unrecorded, see sysLinuxVirtual.cpp). The guard stays off with it unless
+	// KYTY_WRITE_GUARD_UFFD=1.
 	if (WriteGuard::Enabled()) {
 		const char* uffd = std::getenv("KYTY_UFFD_WP");
 #if defined(KYTY_STEAM_DECK)
@@ -828,7 +833,12 @@ void GuestGpu::ThreadRun(void* data) {
 #else
 		const bool watch = uffd != nullptr && uffd[0] == '1';
 #endif
-		if (watch) {
+		// KYTY_WRITE_GUARD_UFFD=1 (default 0): the cause fixed (the views' protection recorded, sysLinuxVirtual.cpp), the
+		// guard kept.
+		const char* fixed = std::getenv("KYTY_WRITE_GUARD_UFFD");
+		if (watch && fixed != nullptr && fixed[0] == '1') {
+			std::printf("Write guard: on with the userfaultfd write watch (KYTY_WRITE_GUARD_UFFD=1, issue #289)\n");
+		} else if (watch) {
 			kyty_local_write_guard_mode.store(0, std::memory_order_relaxed);
 			std::printf("Write guard: off with the userfaultfd write watch (KYTY_UFFD_WP, issue #289)\n");
 		}
@@ -1156,6 +1166,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	while (execution.m_buffer_stack.size() > stop_depth) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
+			// (KYTY_EAGER_FEEDBACK: completed copy-feedback snapshots written back between packets.)
+			g_gpu_state->m_renderer.GetBufferCache().WriteBackCompletedFeedback(true);
 		}
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
 		auto&      cursor       = execution.m_buffer_stack[buffer_index];
