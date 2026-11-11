@@ -60,7 +60,13 @@ folder (usually named `PPSA01341-app0`).
 - Optional: the folder packed into one ZArchive file (`.zar`, about two thirds of its size) works
   too, read without extracting it: choose it with the launcher's `.zar...` button, or run
   `run.cmd -Game "D:\Games\PPSA01341-app0.zar"`. Pack it with `zarchive.exe <folder> <file.zar>`
-  (ZArchive, https://github.com/Exzap/ZArchive/releases). The folder stays the main way.
+  (ZArchive, https://github.com/Exzap/ZArchive/releases). The folder stays the main way. Packing needs
+  about 55 GB free where the `.zar` goes; write it next to the folder, not inside it. If it stops with
+  "Failed to open input file" on a long file name, the path is longer than Windows' 260 characters:
+  move the folder near the drive root (for example `D:\PPSA01341-app0`) and pack again, or turn on
+  Windows' long paths (`LongPathsEnabled` = 1 under
+  `HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FileSystem`)
+  ([#240](https://github.com/chenxiao07/KytyPS5/issues/240), @blazouf).
 - On a hard disk (HDD): pack the game into a `.zar` there and keep the emulator folder (with its
   `_PipelineCache`, about 6 GB) on an SSD. Unpacked on a busy hard disk, every small read of the game
   waited 100-500 ms: long area loads and freezes while walking; packed, with the emulator on the SSD, it
@@ -260,12 +266,24 @@ shortcut):
 | `-Set KYTY_FSR_SHARPNESS=0.3` | With `-Upscaler fsr`: FSR 3's own sharpening, 0 (none) to 1 (the launcher's "Sharpening"; 0.6, Medium, by default) |
 | `-FrameGen 1` | DLSS frame generation, the number of generated frames per rendered one (`1` = 2x, up to `5`; RTX 40 or newer, needs Streamline) |
 | `-Gpu 1` | The graphics card on a PC with more than one: its number in the log's `Vulkan GPU <n>:` lines, or a part of its name (`-Gpu 4090`); give `precompile.cmd` the same `-Gpu`, so the shaders are compiled for that card. Without it the first discrete GPU, in the order Windows' graphics settings give |
+| `-Set KYTY_SPECULATE=4` | Experimental: the game's GPU work translated ahead by worker threads (parallel translation, mode 4), faster where the render thread limits the frame rate (+6% to +16% over the worlds in one test at 120 fps: Core i9-12900K, RTX 5090). Needs 28 GB of RAM or more (it uses about 3.6 GB more) and at least 9 logical CPUs on the performance cores; otherwise it stays off and the log says so |
 | `-Set KEY=VALUE` | An emulator switch, e.g. `-Set KYTY_SHADER_PREFETCH=0` (several: `-Set A=1,B=2`); the issues name the ones worth trying |
 
 The launcher has a box for these too (Advanced, "Command-line options"), written as after `run.cmd`: its `-Set`
 pairs join the launcher's own (one of the same name replaces the launcher's), and another option replaces the
 launcher's of the same name, e.g. `-RenderHeight 900` or `-Set KYTY_DLSS_PRESET=E`. If the game no longer starts,
 clear the box.
+
+### Cheats
+
+The package has no cheats; it applies a GoldHEN-style cheat file (JSON with `"id"`, `"version"`, `"process"` and
+`"mods"`, as made for the PS5 by others) saved as `_Patches\PPSA01341.json` (the game's title id) in the package
+folder. The launcher's Game page turns it on ("Cheats") and picks which cheats apply; without the launcher,
+`run.cmd -Patch _Patches\PPSA01341.json`. In the file, a cheat (an entry of `"mods"`) with `"enabled": false` is left
+out; one with `"enabled": true` or without the field is applied. The file must be for the game's version
+(`"version": "01.007.000"` for 1.07): for another version the emulator stops at start, and the log says
+`Game cheat error: cheat file does not match the loaded game`. The log has a `Successfully applied cheat: <name>`
+line for each cheat applied. (The Steam Deck: see its guide, "Options".)
 
 ## Game language (Chinese, Japanese, Korean and others)
 
@@ -362,7 +380,7 @@ There are two levels of preparation, both specific to the graphics card and driv
 
 ## Controls
 
-The Windows launcher also offers **Game → Keyboard and mouse prompts**, off by default.
+The launchers (Windows and Linux) also offer **Game → Keyboard and mouse prompts**, off by default.
 For an extracted PPSA01341 v1.07 game folder, it applies 22 English key/mouse icons and matching
 keyboard/mouse bindings on Play. **Game → Keyboard controls → Edit controls…** lets you change
 keys, mouse buttons, wheel directions and sensitivity; the prompts follow the saved layout.
@@ -439,6 +457,7 @@ With any of them, only your own keys work on the keyboard (none of the layout ab
 | `launch.json` | The emulator's command line and extra switches; normally left alone |
 | `launcher-settings.json` | The launcher's settings |
 | `Content\<title>`, `dlc_emu.ini` | Add-on content (DLC), if you add it (see "Add-on content") |
+| `_Patches\<title>.json` | A cheat file, if you add one (see "Cheats") |
 
 ## Updating to a newer package
 
@@ -463,6 +482,13 @@ hurts.
   (up to 200). Where the CPU is at its limit and the game makes its sound too late, the sound is stretched a
   little to fill the gaps instead of cutting out (`-Set KYTY_AUDIO_STRETCH=0` turns that off).
 - It uses a lot of memory and video memory: on PCs with too little it may just exit.
+- Small square holes that come and go where the game's decals overlap: the candle wax in the Nexus, the bottom of
+  some castle walls in 1-3 (issue #315). The game blends each decal into what the one before it left, without a
+  barrier between them; the PS5 runs them nearly in order, a PC graphics card at the same time.
+  `run.cmd -Set KYTY_DRAW_READ_AFTER_WRITE=1` (or `-Set KYTY_DRAW_READ_AFTER_WRITE=1` in the launcher's Advanced >
+  "Command-line options") orders them and the holes go, but where there are hundreds of decals the frame rate can
+  drop by up to ~15% (Boletaria's start without the 60 fps cap: 73 -> 61 fps on an RTX 5090; at 60 fps it still
+  held 60 there). Off by default.
 - NVIDIA's Low Latency Mode **Ultra** (NVIDIA Control Panel) makes the emulator's presents wait: uneven frame times
   (RTSS and the emulator's panel disagree) and fewer frames (issue #129). Set Low Latency Mode to Off or On for
   `kyty_emulator.exe` (Manage 3D settings > Program Settings).
@@ -472,6 +498,11 @@ hurts.
   (`run.cmd -Set KYTY_READ_GUARD=0` goes back to no access, for comparison). If you still get this blue screen,
   please report it in issue #50. A full RAM still makes the game slow: close other large programs while playing
   and keep a page file of at least 32 GB.
+- With less than 1.5 GB of RAM left (16 GB PCs with other programs open), the ground, walls or light can go black
+  for single frames (issues #159, #319): the price of the guard pages above, which let the game read some of the
+  data it gets back from the graphics card a moment too early. Close the browser and other large programs before
+  playing. `-Set KYTY_HOT_READS_MIN_AVAIL_MB=0` keeps the flicker away at any free RAM, but weakens the blue-screen
+  protection when the RAM runs completely full.
 - On some TVs the picture tears or stutters with VSync on. A user's fix on a 60 Hz TV with an NVIDIA
   card (issue #30): in the NVIDIA Control Panel, Manage 3D settings > Program Settings, add
   `kyty_emulator.exe` and set "Vertical sync" to On and "Vulkan/OpenGL present method" to "Prefer native".
