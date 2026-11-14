@@ -2196,7 +2196,9 @@ struct PipelineCache::ProgramCache {
 						job->module     = CreateModule(device, job->options, job->result->spirv);
 						job->info       = TakeOnWorker(*job->result);
 					} catch (const Common::RecoverableExit& refused) {
+						// (A line of its own in the log: most exit messages end without one.)
 						job->refused = refused.message;
+						if (job->refused.empty() || job->refused.back() != '\n') job->refused += '\n';
 					}
 					job->done.store(true, std::memory_order_release);
 				});
@@ -4476,6 +4478,10 @@ bool PipelineCache::TakeMaterializationFailure() {
 
 uint32_t PipelineCache::TableFormatOnlyBuffers(const void* want, const void* got) const {
 	if (want == nullptr || got == nullptr) return UINT32_MAX;
+	// Under the lock: ProgramCache::Get inserts and erases programs under it, and a warmup beside the game
+	// (TranslateWarmup) inserts them from its own thread. The callers (TableResolveSet, TableStore) look the
+	// programs up with GetGraphicsPrograms first, which has released it by then (Common::Mutex is recursive anyway).
+	Common::LockGuard lock(m_mutex);
 	const ProgramCache::ProgramKey*  kw = nullptr;
 	const ProgramCache::ProgramKey*  kg = nullptr;
 	const ProgramCache::Permutation* mw = nullptr;
