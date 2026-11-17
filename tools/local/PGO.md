@@ -13,6 +13,8 @@ profile 里改过的函数会因哈希不符而失去 PGO，需要重新训练�
    它在 `_Build\windows-pgogen` 构建插桩版本（`-DKYTY_PGO_GENERATE=ON`），用它跑训练场景
    （基准路线走过去站立、转镜头、走进遗迹、横移），用 live 命令 `pgo <file>` 写出 profile，
    再用 `llvm-profdata merge` 得到 `_Build\pgo\windows\kyty-<日期>.profdata`。
+   插桩版本带 `KYTY_PREFETCH_WAIT=1` 启动：游戏的第一条指令等着色器预取把所有程序翻译完（最多 `KYTY_PREFETCH_WAIT_S` 秒，默认 600，限 1-7200；pgo-train 给 1200），
+   等待结束时计数不清零（日志 `Shader prefetch wait: done`）：模拟器的启动和着色器预取照常计数，和不等待的训练一样；只是游戏在预取完成后才开始，所以没有一帧是在翻译的同时录下的。到 HUD 时日志里缺 `Shader prefetch: all` 或这一行、或等待超时的场景不出 profile。
 2. 把旧的 `kyty.profdata` 另存一份，新文件复制成 `kyty.profdata`；路径不变时 Ninja 不会重编，
    所以先 `cmake --build _Build\windows --target clean` 再 `build-windows.cmd`。
 3. 用 `ab-exe.ps1` 对比旧 profile 的可执行文件（先复制到自己的目录）和新构建。
@@ -107,6 +109,17 @@ B 为新的），abx 两轮 ABBA，120 Hz 上限，每次启动两个 10 秒窗�
 - 1-1 加 `KYTY_SCOUT=0`（6 + 6 次启动）：14.01 → 14.21 ms，fps 69.69 → 68.39，略慢，部分来自场景波动（这个位置慢的那几次
   启动，每帧写异常多约 30%、上传多约 2 MB，两边都有）。scout 停下的只有核心很少的电脑；Steam Deck 用的是 Linux 的 profile。
 采用新 profile，旧的另存为 `_Build\pgo\windows\kyty-before-20261112.profdata`。
+
+2026-11-17（台式机）：合并 PR #342（1bcf96af，不含它用于验证的 profile 提交）之后，在 7a44a897 上用 `pgo-multi.ps1`
+默认的五次运行（模式 0）重新训练；训练前先清空 `_Build\windows-pgogen` 并删掉 `_Build\ab\pgogen` 里的旧插桩程序，链接失败时
+就不会拿旧程序去训练。这台电脑 11-16 换了 BIOS（微码 0x137），两个不稳的 P 核又开着，所以训练、构建和对比都在进程掩码
+0xFFFFCF 下进行（避开 CPU 4/5）。重扫只剩 redZonePatcher 17 和 graphicsRun 1（训练开关的分支，设计如此）。abx ABBA，
+120 Hz 上限，每次启动两个 10 秒窗口，同一份源码对比（A 为 11-12 的 profile，B 为新的），模式 0：
+- 1-1：渲染线程 13.74 → 14.19 ms/帧，fps 67.20 → 65.28（B1 那次每帧写异常 444，A 两次约 310：这个位置慢的那种启动）；
+- Latria：12.84 → 12.81 ms，fps 74.85 → 74.38；
+- 1-1 竞技场：8.36 → 8.07 ms，fps 112.85 → 114.55。
+另外 1-1 上合并前（3e5ecbfc，11-12 的 profile）对合并后（新 profile）：14.33 → 13.73 ms，fps 66.10 → 68.03（A1 写异常 460）。
+合并加重训后模式 0 没有变慢。采用新 profile，旧的另存为 `_Build\pgo\windows\kyty-before-20261117.profdata`。
 
 ## 推测模式（`KYTY_SPECULATE=4`）
 

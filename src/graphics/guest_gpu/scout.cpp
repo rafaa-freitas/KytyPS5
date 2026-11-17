@@ -11,6 +11,8 @@
 #include "kernel/memory.h"
 
 #include "live-counters.h"
+#include "live-switch.h"
+#include "local-platform.h"
 #include "spin-gate.h"
 
 #include <algorithm>
@@ -284,10 +286,24 @@ bool Passed(uint64_t sequence, uint32_t ordinal) {
 	return (render >> 24u) > sequence || ((render >> 24u) == sequence && (render & 0xffffffu) > ordinal);
 }
 
+// While parallel translation is on (KYTY_SPECULATE=4) the speculation threads translate the table
+// draws, and the GPU thread takes few tickets: at the 1-1 stand ~50 of the ~900 the scout made a
+// frame (mode 0: ~1450 of ~1680), for a CPU it held among the render threads'. The scout then
+// stands down as with the spin gate shut. Live scout_spec_stand_down (KYTY_SCOUT_SPEC_STAND_DOWN; 1
+// the default, 0: it walks in mode 4 too).
+bool StandDown() {
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 4) return false;
+	static auto& on = LiveSwitch::Find("scout_spec_stand_down", [] {
+		const char* env = std::getenv("KYTY_SCOUT_SPEC_STAND_DOWN");
+		return env != nullptr && *env != 0 ? std::strtoll(env, nullptr, 10) : 1;
+	}());
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
 // A wait for the render thread: pause, then yield. False while the spin gate is shut (spin-gate.h: fewer than three of
 // the process's CPUs idle): the scout stands down instead of holding a core the game's threads want.
 bool Pause(uint32_t& spin) {
-	if (!SpinGate::Open(false)) return false;
+	if (!SpinGate::Open(false) || StandDown()) return false;
 	if (++spin < 64) _mm_pause();
 	else std::this_thread::yield();
 	return true;
@@ -723,6 +739,8 @@ bool Walk(State& state, const FeedEntry& entry) {
 
 void Main() {
 	KYTY_PROFILER_THREAD("Thread_Scout");
+	// (Named like the other threads of the emulator: per-thread CPU lists showed it as an unnamed ~85-93% thread.)
+	LocalPlatform::SetThreadName("Kyty.Scout");
 	auto     state = std::make_unique<State>();
 	uint64_t last  = 0; // the last submission fed (a gap: Feed dropped one on a full ring)
 	for (uint32_t spin = 0;;) {
@@ -743,7 +761,7 @@ void Main() {
 		last = entry.sequence;
 		// (A submission the render thread is past: its commands may be the game's again; its registers are lost. While
 		// the spin gate is shut, every submission: the scout stands down, its thread asleep between feeds.)
-		const bool shut = !SpinGate::Open(false);
+		const bool shut = !SpinGate::Open(false) || StandDown();
 		if (shut || (g_render.load(std::memory_order_acquire) >> 24u) > entry.sequence) {
 			if (!((g_render.load(std::memory_order_acquire) >> 24u) > entry.sequence)) state->fence = std::max(state->fence, entry.sequence);
 			if (entry.reset) state->registers = {};
